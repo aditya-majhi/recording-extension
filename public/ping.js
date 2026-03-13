@@ -1,0 +1,1 @@
+window.__AUTOMATION_RECORDER_INSTALLED__ = true;

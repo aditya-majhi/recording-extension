@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "Automation Recorder",
+  "description": "Silent bridge between a web app and the browser DOM for recording user interaction steps and tab video.",
+  "version": "0.3.0",
+  "action": {
+    "default_title": "Automation Recorder"
+  },
+  "background": {
+    "service_worker": "src/background/background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content/index.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "permissions": [
+    "tabCapture",
+    "tabs",
+    "storage",
+    "activeTab",
+    "offscreen",
+    "scripting",
+    "contextMenus"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "externally_connectable": {
+    "matches": [
+      "http://localhost:5173/*",
+      "http://localhost:3000/*"
+    ]
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "ping.js",
+        "offscreen.html",
+        "offscreen.js"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
