@@ -6,13 +6,15 @@ let lastClick = { selector: null, time: 0 };
 let flushIntervalId = null;
 let lastRightClickedElement = null;
 
-// Track pending input steps so we only record the FINAL value
-// selector → { timeoutId }
 const pendingInputs = new Map();
 
-// Track last recorded input step index per field so we overwrite instead of adding
-// selectorKey (css/xpath) → index in `steps`
+// Maps selectorKey → index in the GLOBAL steps array (never reset mid-recording)
+// Survives flushes so we can overwrite the correct step across flush boundaries
 const lastInputStepIndex = new Map();
+
+// How many steps have already been flushed to background.
+// steps[0] in the local array corresponds to global index flushedCount.
+let flushedCount = 0;
 
 const CLICK_DEBOUNCE_MS = 300;
 const INPUT_DEBOUNCE_MS = 800;
@@ -65,9 +67,7 @@ function getCssSelector(element) {
       let sibling = el;
       let index = 1;
       while ((sibling = sibling.previousElementSibling)) {
-        if (sibling.tagName === el.tagName) {
-          index++;
-        }
+        if (sibling.tagName === el.tagName) index++;
       }
       selector += `:nth-of-type(${index})`;
     }
@@ -109,18 +109,14 @@ function getElementValue(el) {
   if (!el) return null;
   if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
     const type = (el.getAttribute("type") || "text").toLowerCase();
-    if (type === "checkbox" || type === "radio") {
-      return el.checked;
-    }
+    if (type === "checkbox" || type === "radio") return el.checked;
     return el.value;
   }
-  if (el.tagName === "SELECT") {
-    return el.value;
-  }
+  if (el.tagName === "SELECT") return el.value;
   return el.textContent?.trim() ?? null;
 }
 
-// ── Label / Name Discovery ──
+// ── Label / Name Discovery ──────────────────────────────────────────────────
 function findLabelText(element) {
   const id = element.id;
   if (id) {
@@ -132,8 +128,9 @@ function findLabelText(element) {
   const wrappingLabel = element.closest("label");
   if (wrappingLabel) {
     const clone = wrappingLabel.cloneNode(true);
-    const inputs = clone.querySelectorAll("input, textarea, select");
-    inputs.forEach((i) => i.remove());
+    clone
+      .querySelectorAll("input, textarea, select")
+      .forEach((i) => i.remove());
     const text = clone.textContent?.trim();
     if (text && text.length < 60) return text;
   }
@@ -151,7 +148,7 @@ function findLabelText(element) {
   const placeholder = element.getAttribute("placeholder");
   if (placeholder && placeholder.length < 60) return placeholder;
 
-  let prev = element.previousElementSibling;
+  const prev = element.previousElementSibling;
   if (prev) {
     const text = prev.textContent?.trim();
     if (text && text.length < 60) return text;
@@ -200,7 +197,7 @@ function generateVariableName(element, kind) {
   return `${prefix}_${fallback}`.slice(0, 50);
 }
 
-// ── Step & Variable Creation ──
+// ── Step & Variable Creation ─────────────────────────────────────────────────
 function createStep(type, element, value = null) {
   if (!element) return null;
   const { css, xpath } = buildSelectors(element);
@@ -215,26 +212,55 @@ function createStep(type, element, value = null) {
   };
 }
 
-// For input steps: keep only the *latest* step per selector
+/**
+ * Record an input step for a field, overwriting any previous step for the
+ * same field — even if that step was already flushed to the background.
+ *
+ * Strategy:
+ *  - lastInputStepIndex stores the GLOBAL index (flushedCount + local index).
+ *  - If the global index is still in the local `steps` array we overwrite it.
+ *  - If it was already flushed we send a targeted PATCH message to background
+ *    so it can overwrite that step in its own array.
+ */
 function recordInputStep(element, value) {
   const step = createStep("input", element, value);
   if (!step) return;
 
-  const key =
-    (step.selector && (step.selector.css || step.selector.xpath)) || null;
-
+  const key = step.selector.css || step.selector.xpath;
   if (!key) {
     steps.push(step);
     return;
   }
 
-  const existingIndex = lastInputStepIndex.get(key);
-  if (existingIndex != null) {
-    steps[existingIndex] = step;
-  } else {
-    const index = steps.length;
+  const globalIndex = lastInputStepIndex.get(key);
+
+  if (globalIndex == null) {
+    // First time we see this field — just push
+    const newGlobalIndex = flushedCount + steps.length;
     steps.push(step);
-    lastInputStepIndex.set(key, index);
+    lastInputStepIndex.set(key, newGlobalIndex);
+    return;
+  }
+
+  const localIndex = globalIndex - flushedCount;
+
+  if (localIndex >= 0 && localIndex < steps.length) {
+    // Step is still in the local buffer → overwrite directly
+    steps[localIndex] = step;
+  } else {
+    // Step was already flushed → tell background to patch it
+    chrome.runtime.sendMessage(
+      {
+        type: "RECORDER_PATCH_STEP",
+        globalIndex,
+        step,
+      },
+      () => {
+        /* ignore errors */
+      },
+    );
+    // Also update globalIndex in case value changes again after another flush
+    lastInputStepIndex.set(key, globalIndex);
   }
 }
 
@@ -262,28 +288,32 @@ function createVariable(kind) {
   };
 }
 
-// ── Flush ──
+// ── Flush ────────────────────────────────────────────────────────────────────
 function flush() {
   if (!isRecording) return;
   if (!steps.length && !variables.length) return;
 
   const payload = { type: "RECORDER_FLUSH" };
+
   if (steps.length) {
     payload.steps = [...steps];
+    // Advance the flushed counter but DO NOT clear lastInputStepIndex
+    // so overwrite logic keeps working across flush boundaries
+    flushedCount += steps.length;
     steps = [];
-    lastInputStepIndex.clear();
   }
+
   if (variables.length) {
     payload.variables = [...variables];
     variables = [];
   }
 
   chrome.runtime.sendMessage(payload, () => {
-    // ignore errors
+    /* ignore errors */
   });
 }
 
-// ── Event Handlers ──
+// ── Event Handlers ───────────────────────────────────────────────────────────
 function handleClick(event) {
   const target = event.target;
   if (!(target instanceof Element)) return;
@@ -326,11 +356,9 @@ function handleInput(event) {
   const key = css || target;
 
   const existing = pendingInputs.get(key);
-  if (existing) {
-    clearTimeout(existing.timeoutId);
-  }
+  if (existing) clearTimeout(existing.timeoutId);
 
-  // SELECT: record immediately, keep only last via recordInputStep
+  // SELECT: record immediately
   if (tag === "SELECT") {
     const value = getElementValue(target);
     recordInputStep(target, value);
@@ -338,7 +366,7 @@ function handleInput(event) {
     return;
   }
 
-  // INPUT/TEXTAREA/contenteditable: debounce, then recordInputStep
+  // INPUT / TEXTAREA / contenteditable: debounce
   const timeoutId = setTimeout(() => {
     const value = getElementValue(target);
     recordInputStep(target, value);
@@ -364,9 +392,8 @@ function handleBlur(event) {
   if (existing) {
     clearTimeout(existing.timeoutId);
     pendingInputs.delete(key);
-
+    // Force final step immediately on blur
     const value = getElementValue(target);
-    // On blur, force a final step for that field, overwriting previous one
     recordInputStep(target, value);
   }
 }
@@ -381,7 +408,7 @@ function handleContextMenu(event) {
   lastRightClickedElement = target;
 }
 
-// ── Public API ──
+// ── Public API ───────────────────────────────────────────────────────────────
 export function startRecording() {
   if (isRecording) return;
   isRecording = true;
@@ -390,6 +417,7 @@ export function startRecording() {
   lastClick = { selector: null, time: 0 };
   pendingInputs.clear();
   lastInputStepIndex.clear();
+  flushedCount = 0; // reset global counter for fresh session
 
   if (!listenersAttached) {
     document.addEventListener("click", handleClick, true);
@@ -408,31 +436,57 @@ export function stopRecording() {
   if (!isRecording) return;
   isRecording = false;
 
-  for (const [, { timeoutId }] of pendingInputs) {
+  // Flush all pending debounced inputs immediately
+  for (const [key, { timeoutId }] of pendingInputs) {
     clearTimeout(timeoutId);
+    // key is either a css string or the element reference itself
+    if (typeof key === "string") {
+      // find matching element — best effort
+      try {
+        const el = document.querySelector(key);
+        if (el) recordInputStep(el, getElementValue(el));
+      } catch {
+        /* invalid selector, skip */
+      }
+    }
   }
   pendingInputs.clear();
-  lastInputStepIndex.clear();
 
-  flush();
+  flush(); // send whatever remains
 
   if (flushIntervalId) {
     clearInterval(flushIntervalId);
     flushIntervalId = null;
   }
+
+  // Reset everything AFTER final flush
+  lastInputStepIndex.clear();
+  flushedCount = 0;
 }
 
 export function getStepsAndVariables() {
-  // Flush pending inputs before returning
-  for (const [, { timeoutId }] of pendingInputs) {
+  // Flush all pending debounced inputs first
+  for (const [key, { timeoutId }] of pendingInputs) {
     clearTimeout(timeoutId);
+    if (typeof key === "string") {
+      try {
+        const el = document.querySelector(key);
+        if (el) recordInputStep(el, getElementValue(el));
+      } catch {
+        /* skip */
+      }
+    }
   }
   pendingInputs.clear();
 
   const result = { steps: [...steps], variables: [...variables] };
+
+  // Clear local buffers but keep lastInputStepIndex intact
+  // in case stopRecording() is called right after
   steps = [];
+  flushedCount += result.steps.length;
   variables = [];
-  lastInputStepIndex.clear();
+
   return result;
 }
 

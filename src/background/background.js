@@ -346,6 +346,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
+  // ── Patch a previously flushed input step (overwrite duplicate) ──
+  if (type === "RECORDER_PATCH_STEP") {
+    if (currentRecording) {
+      const { globalIndex, step } = message;
+      if (
+        typeof globalIndex === "number" &&
+        globalIndex >= 0 &&
+        globalIndex < currentRecording.steps.length
+      ) {
+        currentRecording.steps[globalIndex] = step;
+      }
+    }
+    sendResponse({ success: true });
+    return;
+  }
+
   // ── Get recording state ──
   if (type === "GET_RECORDING_STATE") {
     sendResponse({
