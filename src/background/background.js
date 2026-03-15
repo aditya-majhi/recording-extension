@@ -13,6 +13,33 @@ import { uploadRecording, saveAuthToken } from "../services/apiService.js";
 // ── State ──
 let currentRecording = null;
 
+// ── Deduplicate helper: for input steps, keep only the last per selector ──
+function deduplicateInputSteps(allSteps) {
+  // Find the last index of each input step by selector key
+  const lastInputIdx = new Map();
+  allSteps.forEach((step, index) => {
+    if (step.type !== "input") return;
+    const key = step.selector?.css || step.selector?.xpath;
+    if (key) lastInputIdx.set(key, index);
+  });
+  return allSteps.filter((step, index) => {
+    if (step.type !== "input") return true;
+    const key = step.selector?.css || step.selector?.xpath;
+    if (!key) return true;
+    return lastInputIdx.get(key) === index;
+  });
+}
+
+// ── Deduplicate helper: merge variables by id ──
+function mergeVariables(existing, incoming) {
+  const existingVarIds = new Set(existing.map((v) => v.id));
+  const newUniqueVars = incoming.filter((v) => !existingVarIds.has(v.id));
+  if (newUniqueVars.length) {
+    return [...existing, ...newUniqueVars];
+  }
+  return existing;
+}
+
 // ── Badge Helpers ──
 function setBadge(text, color = "#FF0000") {
   chrome.action.setBadgeText({ text });
@@ -24,16 +51,15 @@ function clearBadge() {
   chrome.action.setTitle({ title: "Automation Recorder" });
 }
 
-// ── Safely send message to tab (ignore errors if tab is gone) ──
 function sendToTab(tabId, message) {
   try {
     chrome.tabs.sendMessage(tabId, message, () => {
       if (chrome.runtime.lastError) {
-        // tab might be closed, ignore
+        /* tab might be closed */
       }
     });
   } catch {
-    // ignore
+    /* ignore */
   }
 }
 
@@ -58,7 +84,6 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (!tab?.id) return;
-
   if (info.menuItemId === "start-recording") {
     startRecordingFlow(tab.id, null);
     return;
@@ -76,37 +101,26 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  ACTION CLICK — This is the user gesture that grants activeTab permission
-//  When user clicks the extension icon, we can call getMediaStreamId
+//  ACTION CLICK
 // ══════════════════════════════════════════════════════════════════════════════
 chrome.action.onClicked.addListener(async (tab) => {
   console.log("[BG] 🖱 Action icon clicked, tab:", tab.id);
 
-  // ── No recording active → ignore ──
   if (!currentRecording) {
-    console.log("[BG] No recording in progress, ignoring action click");
+    console.log("[BG] no currentRecording, ignoring");
     return;
   }
-
-  // ── Video already recording → ignore ──
   if (currentRecording.videoController) {
-    console.log("[BG] Video already recording, ignoring action click");
+    console.log("[BG] video already running, ignoring");
     return;
   }
 
-  // ── Recording active, video pending → START VIDEO NOW ──
   if (currentRecording.pendingVideoForTab) {
     const tabId = currentRecording.pendingVideoForTab;
-    console.log("[BG] Starting video capture via action click for tab:", tabId);
 
     try {
-      // THIS WORKS because chrome.action.onClicked IS a real user gesture
-      // → Chrome grants activeTab → getMediaStreamId succeeds
       const streamId = await getStreamId(tabId);
-      console.log("[BG] getStreamId SUCCESS");
-
       const controller = await startCapture(streamId);
-      console.log("[BG] startCapture SUCCESS:", controller);
 
       currentRecording.videoController = controller;
       currentRecording.videoReady = true;
@@ -114,26 +128,18 @@ chrome.action.onClicked.addListener(async (tab) => {
 
       setBadge("REC", "#CC0000");
       chrome.action.setTitle({ title: "Recording in progress (with video)" });
-
-      // Tell the content script to update the bar → red "Recording in progress"
       sendToTab(tabId, { type: "VIDEO_STARTED" });
-
-      console.log(
-        "[BG] ✅ Video capture started successfully via action click",
-      );
     } catch (err) {
-      console.error("[BG] ❌ Video start failed on action click:", err.message);
+      console.error("[BG] ❌ Video start failed:", err.message);
 
-      // Video failed — continue recording without video
       if (currentRecording) {
         currentRecording.videoController = null;
         currentRecording.videoReady = true;
         currentRecording.pendingVideoForTab = null;
       }
 
-      setBadge("REC", "#FF8800"); // orange = recording without video
+      setBadge("REC", "#FF8800");
       chrome.action.setTitle({ title: "Recording in progress (no video)" });
-
       sendToTab(currentRecording?.tabId || tab.id, { type: "VIDEO_SKIPPED" });
     }
   }
@@ -142,13 +148,17 @@ chrome.action.onClicked.addListener(async (tab) => {
 // ══════════════════════════════════════════════════════════════════════════════
 //  CORE RECORDING FLOW
 // ══════════════════════════════════════════════════════════════════════════════
-
 async function startRecordingFlow(tabId, testCaseId) {
-  console.log("[BG] ====== startRecordingFlow ======");
-  console.log("[BG] tabId:", tabId, "testCaseId:", testCaseId);
+  console.log(
+    "[BG] ====== startRecordingFlow ======",
+    "tabId:",
+    tabId,
+    "testCaseId:",
+    testCaseId,
+  );
 
   if (currentRecording) {
-    console.warn("[BG] Already recording, rejecting");
+    console.log("[BG] startRecordingFlow — ALREADY_RECORDING, returning error");
     return { success: false, error: "ALREADY_RECORDING" };
   }
 
@@ -159,12 +169,15 @@ async function startRecordingFlow(tabId, testCaseId) {
     variables: [],
     videoController: null,
     videoReady: false,
-    pendingVideoForTab: tabId, // video waiting for user to click action icon
+    pendingVideoForTab: tabId,
+    finalFlushReceived: false,
   };
+  console.log(
+    "[BG] currentRecording created:",
+    JSON.stringify({ tabId, testCaseId: testCaseId || null }),
+  );
 
-  // 1) Start step recording via content script
   try {
-    console.log("[BG] Sending START_RECORDING to content script...");
     await chrome.tabs.sendMessage(tabId, { type: "START_RECORDING" });
     console.log("[BG] Content script acknowledged START_RECORDING");
   } catch (err) {
@@ -176,54 +189,33 @@ async function startRecordingFlow(tabId, testCaseId) {
     };
   }
 
-  // 2) Set badge to prompt user to click the extension icon
-  setBadge("▶", "#FF6600"); // orange arrow
+  setBadge("▶", "#FF6600");
   chrome.action.setTitle({
     title: "Click to enable video recording for this tab",
   });
 
-  // 3) Try to get streamId directly — this will work if triggered from context menu
-  //    (context menu click IS a user gesture). It will FAIL if triggered from
-  //    onMessageExternal (not a user gesture). That's expected.
   try {
-    console.log(
-      "[BG] Attempting direct getStreamId (may fail from external message)...",
-    );
     const streamId = await getStreamId(tabId);
-    console.log("[BG] Direct getStreamId succeeded!");
-
+    console.log("[BG] getStreamId succeeded:", streamId);
     const controller = await startCapture(streamId);
-    console.log("[BG] Direct startCapture succeeded:", controller);
-
     currentRecording.videoController = controller;
     currentRecording.videoReady = true;
     currentRecording.pendingVideoForTab = null;
-
     setBadge("REC", "#CC0000");
     chrome.action.setTitle({ title: "Recording in progress (with video)" });
-
-    // Tell content script to switch to "recording" bar
     sendToTab(tabId, { type: "VIDEO_STARTED" });
-
-    console.log("[BG] ✅ Direct video start succeeded (context menu trigger)");
+    console.log("[BG] Video capture started successfully");
   } catch (err) {
-    // This is expected when triggered from onMessageExternal
     console.log(
       "[BG] Direct getStreamId failed (expected from external):",
       err.message,
     );
-    console.log("[BG] ⏳ Waiting for user to click extension icon...");
-    // Content script already shows the prompt bar via START_RECORDING handler
   }
 
-  console.log("[BG] ====== startRecordingFlow DONE ======");
-  console.log("[BG] State:", {
-    tabId: currentRecording?.tabId,
-    videoController: !!currentRecording?.videoController,
-    videoReady: currentRecording?.videoReady,
-    pendingVideoForTab: currentRecording?.pendingVideoForTab,
-  });
-
+  console.log(
+    "[BG] startRecordingFlow done — videoPending:",
+    !!currentRecording?.pendingVideoForTab,
+  );
   return {
     success: true,
     videoPending: !!currentRecording?.pendingVideoForTab,
@@ -232,6 +224,7 @@ async function startRecordingFlow(tabId, testCaseId) {
 
 async function stopRecordingFlow() {
   console.log("[BG] ====== stopRecordingFlow ======");
+  console.log("[BG] currentRecording exists:", !!currentRecording);
 
   if (!currentRecording) {
     return {
@@ -243,185 +236,368 @@ async function stopRecordingFlow() {
     };
   }
 
-  console.log("[BG] Current state:", {
-    tabId: currentRecording.tabId,
-    videoController: !!currentRecording.videoController,
-    videoReady: currentRecording.videoReady,
-    stepsCount: currentRecording.steps.length,
-    varsCount: currentRecording.variables.length,
-  });
+  console.log(
+    "[BG] currentRecording state — steps:",
+    currentRecording.steps.length,
+    "vars:",
+    currentRecording.variables.length,
+    "finalFlushReceived:",
+    currentRecording.finalFlushReceived,
+  );
 
-  // Wait for video to be ready (max 5s) — covers race between action click and stop
-  const maxWait = 5000;
-  const pollInterval = 200;
-  let waited = 0;
-  while (currentRecording && !currentRecording.videoReady && waited < maxWait) {
-    console.log("[BG] Waiting for videoReady... (waited:", waited, "ms)");
-    await new Promise((r) => setTimeout(r, pollInterval));
-    waited += pollInterval;
-  }
+  const { tabId, videoController } = currentRecording;
 
-  const { tabId, videoController, steps, variables } = currentRecording;
-  let videoBlob = null;
-
-  // 1) Stop content script
-  try {
-    if (tabId != null) {
-      console.log("[BG] Sending STOP_RECORDING to content...");
+  if (tabId != null) {
+    try {
+      console.log("[BG] sending STOP_RECORDING to tab:", tabId);
       await chrome.tabs.sendMessage(tabId, { type: "STOP_RECORDING" });
-      await new Promise((r) => setTimeout(r, 500)); // wait for final flush
-      console.log("[BG] Content script stopped");
+      console.log("[BG] Content acknowledged STOP_RECORDING");
+    } catch (err) {
+      console.warn("[BG] Error stopping content:", err.message);
     }
-  } catch (err) {
-    console.warn("[BG] Error stopping content:", err.message);
   }
 
-  // 2) Stop video capture
+  const maxFlushWait = 3000;
+  const poll = 100;
+  let waitedFlush = 0;
+  console.log("[BG] waiting for final flush (max", maxFlushWait, "ms)...");
+  while (
+    currentRecording &&
+    !currentRecording.finalFlushReceived &&
+    waitedFlush < maxFlushWait
+  ) {
+    await new Promise((r) => setTimeout(r, poll));
+    waitedFlush += poll;
+  }
+
+  if (currentRecording?.finalFlushReceived) {
+    console.log("[BG] ✅ Final flush received after", waitedFlush, "ms");
+  } else {
+    console.warn("[BG] ⚠ Final flush NOT received within", maxFlushWait, "ms");
+  }
+
+  console.log(
+    "[BG] currentRecording steps after flush wait:",
+    currentRecording?.steps?.length || 0,
+  );
+
+  let videoBlob = null;
   if (videoController) {
     try {
-      console.log("[BG] Stopping video capture...");
       videoBlob = await stopCapture(videoController);
-      console.log(
-        "[BG] Video blob:",
-        videoBlob ? `${videoBlob.size} bytes` : "null",
-      );
+      console.log("[BG] Video blob:", videoBlob?.size, "bytes");
     } catch (err) {
       console.warn("[BG] stopCapture failed:", err.message);
-      videoBlob = null;
     }
-  } else {
-    console.log(
-      "[BG] No video controller — user didn't click extension icon or video failed",
-    );
   }
 
-  // Gather final steps/vars
-  const finalSteps = currentRecording
-    ? [...currentRecording.steps]
-    : [...steps];
-  const finalVars = currentRecording
-    ? [...currentRecording.variables]
-    : [...variables];
+  const finalSteps = [...(currentRecording?.steps || [])];
+  const finalVars = [...(currentRecording?.variables || [])];
 
-  // Clear state
   clearBadge();
   currentRecording = null;
 
-  console.log("[BG] ====== stopRecordingFlow DONE ======");
   console.log(
-    "[BG] Final: steps:",
+    "[BG] ====== stopRecordingFlow DONE — steps:",
     finalSteps.length,
     "vars:",
     finalVars.length,
-    "hasVideo:",
-    !!videoBlob,
+    "======",
   );
-
-  return {
-    success: true,
-    steps: finalSteps,
-    variables: finalVars,
-    videoBlob,
-  };
+  return { success: true, steps: finalSteps, variables: finalVars, videoBlob };
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  INTERNAL MESSAGES (content script → background)
+//  INTERNAL MESSAGES
 // ══════════════════════════════════════════════════════════════════════════════
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const type = message?.type;
+  console.log(
+    "[BG] onMessage received:",
+    type,
+    "from tab:",
+    sender.tab?.id || "(no tab)",
+  );
 
-  // ── Flush steps/variables from content script ──
   if (type === "RECORDER_FLUSH") {
+    console.log(
+      "[BG] RECORDER_FLUSH — isFinal:",
+      message.isFinal,
+      "steps:",
+      message.steps?.length,
+      "vars:",
+      message.variables?.length,
+    );
+    console.log(
+      "[BG] RECORDER_FLUSH — currentRecording exists:",
+      !!currentRecording,
+    );
+
     if (currentRecording) {
-      const { steps: newSteps = [], variables: newVars = [] } = message;
-      if (Array.isArray(newSteps) && newSteps.length) {
-        currentRecording.steps.push(...newSteps);
+      const {
+        steps: newSteps = [],
+        variables: newVars = [],
+        isFinal = false,
+      } = message;
+
+      if (isFinal) {
+        if (Array.isArray(newSteps) && newSteps.length) {
+          currentRecording.steps = deduplicateInputSteps([
+            ...currentRecording.steps,
+            ...newSteps,
+          ]);
+          console.log(
+            "[BG] ✅ Final flush — appended + deduplicated, total:",
+            currentRecording.steps.length,
+          );
+        } else {
+          // Still deduplicate existing steps in case mid-flushes left duplicates
+          currentRecording.steps = deduplicateInputSteps(
+            currentRecording.steps,
+          );
+          console.log(
+            "[BG] ✅ Final flush — no new steps, deduplicated existing to",
+            currentRecording.steps.length,
+            "steps",
+          );
+        }
+        // Use mergeVariables to prevent duplicate variables on final flush
+        if (Array.isArray(newVars) && newVars.length) {
+          currentRecording.variables = mergeVariables(
+            currentRecording.variables,
+            newVars,
+          );
+          console.log(
+            "[BG] ✅ Final flush — merged variables, total:",
+            currentRecording.variables.length,
+          );
+        }
+        currentRecording.finalFlushReceived = true;
+        console.log("[BG] ✅ finalFlushReceived = true");
+      } else {
+        if (
+          Array.isArray(newSteps) &&
+          newSteps.length > currentRecording.steps.length
+        ) {
+          currentRecording.steps = deduplicateInputSteps(newSteps);
+          console.log(
+            "[BG] Mid-flush — replaced + deduplicated to",
+            currentRecording.steps.length,
+            "steps",
+          );
+        } else if (
+          Array.isArray(newSteps) &&
+          newSteps.length > 0 &&
+          newSteps.length <= currentRecording.steps.length
+        ) {
+          const existingCssKeys = new Set(
+            currentRecording.steps.map(
+              (s) => `${s.type}:${s.selector?.css}:${s.value}`,
+            ),
+          );
+          const brandNew = newSteps.filter(
+            (s) =>
+              !existingCssKeys.has(`${s.type}:${s.selector?.css}:${s.value}`),
+          );
+          if (brandNew.length) {
+            currentRecording.steps = deduplicateInputSteps([
+              ...currentRecording.steps,
+              ...brandNew,
+            ]);
+            console.log(
+              "[BG] Mid-flush — appended + deduplicated, total:",
+              currentRecording.steps.length,
+            );
+          } else {
+            console.log(
+              "[BG] Mid-flush — no new steps to add, keeping",
+              currentRecording.steps.length,
+            );
+          }
+        } else {
+          console.log(
+            "[BG] Mid-flush — content sent 0 steps, keeping existing",
+            currentRecording.steps.length,
+          );
+        }
+        // Use mergeVariables for mid-flush too (already was deduping, now consistent)
+        if (Array.isArray(newVars) && newVars.length) {
+          currentRecording.variables = mergeVariables(
+            currentRecording.variables,
+            newVars,
+          );
+        }
       }
-      if (Array.isArray(newVars) && newVars.length) {
-        currentRecording.variables.push(...newVars);
-      }
+
+      console.log(
+        "[BG] currentRecording.steps NOW:",
+        currentRecording.steps.length,
+      );
+      console.log(
+        "[BG] currentRecording.variables NOW:",
+        currentRecording.variables.length,
+      );
+    } else {
+      console.warn("[BG] ⚠ RECORDER_FLUSH received but NO currentRecording!");
     }
     sendResponse({ success: true });
     return;
   }
 
-  // ── Patch a previously flushed input step (overwrite duplicate) ──
-  if (type === "RECORDER_PATCH_STEP") {
-    if (currentRecording) {
-      const { globalIndex, step } = message;
-      if (
-        typeof globalIndex === "number" &&
-        globalIndex >= 0 &&
-        globalIndex < currentRecording.steps.length
-      ) {
-        currentRecording.steps[globalIndex] = step;
-      }
-    }
-    sendResponse({ success: true });
-    return;
-  }
-
-  // ── Get recording state ──
   if (type === "GET_RECORDING_STATE") {
-    sendResponse({
+    const state = {
       success: true,
       isRecording: !!currentRecording,
       stepCount: currentRecording?.steps?.length ?? 0,
       tabId: currentRecording?.tabId ?? null,
       hasVideo: !!currentRecording?.videoController,
       videoPending: !!currentRecording?.pendingVideoForTab,
-    });
+    };
+    console.log("[BG] GET_RECORDING_STATE response:", JSON.stringify(state));
+    sendResponse(state);
     return;
   }
 
-  // ── Skip video (user clicked "Skip video" button in the bar) ──
   if (type === "SKIP_VIDEO") {
-    console.log("[BG] User skipped video");
+    console.log("[BG] SKIP_VIDEO received");
     if (currentRecording) {
       currentRecording.pendingVideoForTab = null;
       currentRecording.videoReady = true;
       currentRecording.videoController = null;
-
-      setBadge("REC", "#FF8800"); // orange = recording without video
+      setBadge("REC", "#FF8800");
       chrome.action.setTitle({ title: "Recording in progress (no video)" });
     }
     sendResponse({ success: true });
     return;
   }
 
-  // ── Dev: start recording from dev button ──
   if (type === "DEV_START_RECORDING") {
     const tabId = sender.tab?.id;
+    console.log("[BG] DEV_START_RECORDING from tab:", tabId);
     if (tabId == null) {
+      console.error("[BG] DEV_START_RECORDING — NO TAB ID!");
       sendResponse({ success: false, error: "NO_TAB_ID" });
       return;
     }
-    startRecordingFlow(tabId, null).then(sendResponse);
+    startRecordingFlow(tabId, null).then((res) => {
+      console.log("[BG] startRecordingFlow result:", JSON.stringify(res));
+      sendResponse(res);
+    });
     return true;
   }
 
-  // ── Dev: stop recording from dev button ──
   if (type === "DEV_STOP_RECORDING") {
-    stopRecordingFlow().then((result) => {
-      sendResponse({
-        success: result.success,
-        stepsCount: result.steps.length,
-        variablesCount: result.variables.length,
-        hasVideo: !!result.videoBlob,
-      });
-    });
+    console.log("[BG] DEV_STOP_RECORDING received");
+    console.log("[BG] currentRecording exists:", !!currentRecording);
+    if (currentRecording) {
+      console.log(
+        "[BG] currentRecording state:",
+        JSON.stringify({
+          steps: currentRecording.steps.length,
+          vars: currentRecording.variables.length,
+          finalFlushReceived: currentRecording.finalFlushReceived,
+        }),
+      );
+    }
+
+    if (!currentRecording) {
+      console.error("[BG] DEV_STOP — NO currentRecording!");
+      sendResponse({ success: false, error: "NO_ACTIVE_RECORDING" });
+      return;
+    }
+
+    (async () => {
+      if (!currentRecording.finalFlushReceived) {
+        console.log("[BG] DEV_STOP — waiting for final flush...");
+        const maxWait = 2000;
+        let waited = 0;
+        while (
+          currentRecording &&
+          !currentRecording.finalFlushReceived &&
+          waited < maxWait
+        ) {
+          await new Promise((r) => setTimeout(r, 50));
+          waited += 50;
+        }
+        console.log(
+          "[BG] DEV_STOP — flush wait done, waited:",
+          waited,
+          "ms, received:",
+          currentRecording?.finalFlushReceived,
+        );
+      } else {
+        console.log("[BG] DEV_STOP — finalFlushReceived already true");
+      }
+
+      let videoBlob = null;
+      if (currentRecording?.videoController) {
+        try {
+          videoBlob = await stopCapture(currentRecording.videoController);
+          console.log("[BG] DEV_STOP — video blob:", videoBlob?.size, "bytes");
+        } catch (err) {
+          console.warn("[BG] DEV_STOP — stopCapture failed:", err.message);
+        }
+      }
+
+      const finalSteps = [...(currentRecording?.steps || [])];
+      const finalVars = [...(currentRecording?.variables || [])];
+
+      console.log(
+        "[BG] DEV_STOP — final steps:",
+        finalSteps.length,
+        "vars:",
+        finalVars.length,
+      );
+      if (finalSteps.length > 0) {
+        console.log(
+          "[BG] DEV_STOP — step details:",
+          JSON.stringify(
+            finalSteps.map((s) => ({
+              type: s.type,
+              css: s.selector?.css,
+              value: s.value,
+            })),
+          ),
+        );
+      }
+
+      clearBadge();
+      currentRecording = null;
+
+      const response = {
+        success: true,
+        stepsCount: finalSteps.length,
+        variablesCount: finalVars.length,
+        steps: finalSteps,
+        variables: finalVars,
+        hasVideo: !!videoBlob,
+      };
+      console.log(
+        "[BG] DEV_STOP — sending response:",
+        JSON.stringify({
+          ...response,
+          steps: `[${response.steps.length} items]`,
+        }),
+      );
+      sendResponse(response);
+    })();
     return true;
   }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  EXTERNAL MESSAGES (Web UI → extension)
+//  EXTERNAL MESSAGES
 // ══════════════════════════════════════════════════════════════════════════════
 chrome.runtime.onMessageExternal.addListener(
   (message, sender, sendResponse) => {
+    console.log(
+      "[BG] onMessageExternal received:",
+      message?.action,
+      "from:",
+      sender.origin || sender.url,
+    );
+
     if (!isValidExternalSender(sender)) {
-      console.warn("[BG] Rejected external message from:", sender?.origin);
       sendResponse({ success: false, error: "UNAUTHORIZED_SENDER" });
       return;
     }
@@ -438,7 +614,6 @@ chrome.runtime.onMessageExternal.addListener(
       return;
     }
 
-    // ── SET_TOKEN ──
     if (action === Actions.SET_TOKEN) {
       const token = message?.token;
       if (!token) {
@@ -452,7 +627,6 @@ chrome.runtime.onMessageExternal.addListener(
       return true;
     }
 
-    // ── GET_RECORDING_STATE ──
     if (action === Actions.GET_RECORDING_STATE) {
       sendResponse({
         success: true,
@@ -464,10 +638,8 @@ chrome.runtime.onMessageExternal.addListener(
       return;
     }
 
-    // ── START_RECORDING ──
     if (action === Actions.START_RECORDING) {
       const { url, testCaseId } = message;
-
       if (!url) {
         sendResponse({ success: false, error: "URL is required" });
         return;
@@ -479,24 +651,12 @@ chrome.runtime.onMessageExternal.addListener(
 
       (async () => {
         try {
-          console.log(
-            "[BG] External START_RECORDING: url:",
-            url,
-            "testCaseId:",
-            testCaseId,
-          );
-
-          // Create new tab
           const tab = await chrome.tabs.create({ url, active: true });
-          console.log("[BG] Tab created, id:", tab.id);
-
-          // Wait for tab to fully load
           await new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
               chrome.tabs.onUpdated.removeListener(listener);
               reject(new Error("Tab load timed out after 30s"));
             }, 30000);
-
             function listener(tabId, info) {
               if (tabId === tab.id && info.status === "complete") {
                 chrome.tabs.onUpdated.removeListener(listener);
@@ -506,17 +666,10 @@ chrome.runtime.onMessageExternal.addListener(
             }
             chrome.tabs.onUpdated.addListener(listener);
           });
-
-          // Wait for content script to initialize
-          console.log("[BG] Tab loaded, waiting for content script...");
           await new Promise((r) => setTimeout(r, 500));
-
-          // Start recording (step recording starts immediately, video waits for action click)
           const result = await startRecordingFlow(tab.id, testCaseId);
-          console.log("[BG] startRecordingFlow result:", result);
           sendResponse(result);
         } catch (err) {
-          console.error("[BG] External START_RECORDING failed:", err);
           sendResponse({
             success: false,
             error: err.message || "FAILED_TO_OPEN_TAB",
@@ -526,11 +679,9 @@ chrome.runtime.onMessageExternal.addListener(
       return true;
     }
 
-    // ── STOP_RECORDING ──
     if (action === Actions.STOP_RECORDING) {
       const effectiveTestCaseId =
         message?.testCaseId || currentRecording?.testCaseId;
-
       if (!effectiveTestCaseId) {
         sendResponse({
           success: false,
@@ -545,7 +696,6 @@ chrome.runtime.onMessageExternal.addListener(
           sendResponse(result);
           return;
         }
-
         try {
           const saved = await uploadRecording({
             testCaseId: effectiveTestCaseId,
@@ -553,7 +703,6 @@ chrome.runtime.onMessageExternal.addListener(
             videoBlob: result.videoBlob,
             variables: result.variables,
           });
-
           sendResponse({
             success: true,
             steps: result.steps,
@@ -562,7 +711,6 @@ chrome.runtime.onMessageExternal.addListener(
             recording: saved,
           });
         } catch (err) {
-          console.error("[BG] Upload failed:", err);
           sendResponse({
             success: false,
             error: err.message || "UPLOAD_FAILED",
@@ -575,11 +723,11 @@ chrome.runtime.onMessageExternal.addListener(
 );
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  SAFETY: stop if the recorded tab is closed
-// ══════════════════════════════════════════════════════════════════════════════
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   if (currentRecording?.tabId === tabId) {
     console.warn("[BG] Recorded tab closed, auto-stopping");
     await stopRecordingFlow();
   }
 });
+
+console.log("[BG] ✅ Background script loaded");
