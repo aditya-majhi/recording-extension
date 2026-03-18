@@ -28,7 +28,6 @@ function handleBeforeUnload() {
   if (!isRecording) return;
   console.log("[RECORDER][beforeunload] Page unloading — emergency flush");
   drainPendingInputs();
-  // Use synchronous sendMessage (best-effort, may not always succeed)
   const compressed = compressSteps([...steps]);
   const vars = [...variables];
   if (!compressed.length && !vars.length) return;
@@ -117,8 +116,594 @@ function getXPath(element) {
   return segs.length ? "/" + segs.join("/") : null;
 }
 
+function detectDataType(element) {
+  if (!(element instanceof Element)) return "string";
+
+  const tag = element.tagName;
+  if (tag === "SELECT") return "enum";
+
+  if (tag === "INPUT") {
+    const type = (element.getAttribute("type") || "text").toLowerCase();
+    switch (type) {
+      case "number":
+      case "range":
+        return "number";
+      case "email":
+        return "email";
+      case "url":
+        return "url";
+      case "tel":
+        return "phone";
+      case "date":
+        return "date";
+      case "datetime-local":
+        return "datetime";
+      case "time":
+        return "time";
+      case "month":
+      case "week":
+        return "date";
+      case "checkbox":
+        return "boolean";
+      case "radio":
+        return "enum";
+      case "password":
+        return "password";
+      case "color":
+        return "color";
+      case "file":
+        return "file";
+      case "hidden":
+        return "string";
+      default:
+        break;
+    }
+
+    const inputmode = element.getAttribute("inputmode");
+    const name = (element.getAttribute("name") || "").toLowerCase();
+    const id = (element.id || "").toLowerCase();
+    const placeholder = (
+      element.getAttribute("placeholder") || ""
+    ).toLowerCase();
+
+    if (inputmode === "numeric" || inputmode === "decimal") return "number";
+    if (inputmode === "email") return "email";
+    if (inputmode === "tel") return "phone";
+    if (inputmode === "url") return "url";
+
+    if (/email/i.test(name + id + placeholder)) return "email";
+    if (/phone|tel|mobile/i.test(name + id + placeholder)) return "phone";
+    if (/date|dob|birth/i.test(name + id + placeholder)) return "date";
+    if (/url|website|link/i.test(name + id + placeholder)) return "url";
+    if (/price|amount|cost|qty|quantity|total/i.test(name + id + placeholder))
+      return "number";
+    if (/zip|pin|postal/i.test(name + id + placeholder)) return "number";
+    if (/password|passwd|pwd/i.test(name + id + placeholder)) return "password";
+
+    const pattern = element.getAttribute("pattern");
+    if (pattern) {
+      if (/\\d/.test(pattern) && !/[a-zA-Z]/.test(pattern)) return "number";
+    }
+
+    return "string";
+  }
+
+  if (tag === "TEXTAREA") return "text";
+
+  const textContent = (element.textContent || "").trim();
+  if (textContent) {
+    if (/^\d+(\.\d+)?$/.test(textContent)) return "number";
+    if (/^\d{4}-\d{2}-\d{2}/.test(textContent)) return "date";
+    if (/^https?:\/\//.test(textContent)) return "url";
+    if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(textContent)) return "email";
+    if (/^(true|false)$/i.test(textContent)) return "boolean";
+  }
+
+  return "string";
+}
+
+// ── Page name extraction ──────────────────────────────────────────────────────
+function getPageName() {
+  // Strategy 1: Breadcrumb — last item is usually the current page
+  const breadcrumb = document.querySelector(
+    '[aria-label="breadcrumb"], .breadcrumb, .breadcrumbs, nav.breadcrumb, ol.breadcrumb, [role="navigation"][aria-label*="breadcrumb" i]',
+  );
+  if (breadcrumb) {
+    const items = breadcrumb.querySelectorAll(
+      "li, a, span, .breadcrumb-item, [aria-current]",
+    );
+    if (items.length) {
+      // Prefer the item with aria-current="page"
+      for (const item of items) {
+        if (item.getAttribute("aria-current") === "page") {
+          const text = item.textContent?.trim();
+          if (text && text.length > 0 && text.length < 60) return text;
+        }
+      }
+      // Otherwise use the last breadcrumb item
+      const last = items[items.length - 1];
+      const text = last.textContent?.trim();
+      if (text && text.length > 0 && text.length < 60) return text;
+    }
+  }
+
+  // Strategy 2: Active nav/tab/sidebar item — indicates current section
+  const activeNavItem = document.querySelector(
+    'nav a.active, nav a[aria-current="page"], nav .active > a, ' +
+      '.sidebar a.active, .sidebar .active > a, .sidebar a[aria-current="page"], ' +
+      ".nav-link.active, .nav-item.active > a, " +
+      '[role="tab"][aria-selected="true"], ' +
+      ".MuiTab-root.Mui-selected, .ant-menu-item-selected, " +
+      ".menu-item.active, .menu-item.selected, " +
+      "a.router-link-active, a.router-link-exact-active",
+  );
+  if (activeNavItem) {
+    const text = activeNavItem.textContent?.trim();
+    if (text && text.length > 0 && text.length < 60) return text;
+  }
+
+  // Strategy 3: Page-level heading (h1 directly under main/body, not inside cards/modals)
+  const mainContent = document.querySelector(
+    'main, [role="main"], #content, #main, .main-content, .page-content, .content-area',
+  );
+  if (mainContent) {
+    // Direct h1/h2 child or shallow descendant of main
+    const heading = mainContent.querySelector(
+      ":scope > h1, :scope > h2, :scope > header h1, :scope > header h2, " +
+        ":scope > div > h1, :scope > div > h2, :scope > .page-header h1, :scope > .page-title",
+    );
+    if (heading) {
+      const text = heading.textContent?.trim();
+      if (text && text.length > 0 && text.length < 60) return text;
+    }
+  }
+
+  // Strategy 4: First visible h1 that is NOT inside a modal, card, sidebar, or accordion
+  const allH1s = document.querySelectorAll("h1");
+  for (const h1 of allH1s) {
+    // Skip headings inside overlay/widget containers
+    if (
+      h1.closest(
+        '[role="dialog"], [aria-modal="true"], .modal, .card, .sidebar, ' +
+          '.drawer, aside, .accordion, .collapse, [role="complementary"]',
+      )
+    ) {
+      continue;
+    }
+    // Skip hidden headings
+    const rect = h1.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    const text = h1.textContent?.trim();
+    if (text && text.length > 0 && text.length < 60) return text;
+  }
+
+  // Strategy 5: First visible h2 (same exclusions)
+  const allH2s = document.querySelectorAll("h2");
+  for (const h2 of allH2s) {
+    if (
+      h2.closest(
+        '[role="dialog"], [aria-modal="true"], .modal, .card, .sidebar, ' +
+          '.drawer, aside, .accordion, .collapse, [role="complementary"]',
+      )
+    ) {
+      continue;
+    }
+    const rect = h2.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    const text = h2.textContent?.trim();
+    if (text && text.length > 0 && text.length < 60) return text;
+  }
+
+  // Strategy 6: aria-label on main/content region
+  if (mainContent) {
+    const ariaLabel = mainContent.getAttribute("aria-label");
+    if (ariaLabel && ariaLabel.length < 60) return ariaLabel;
+  }
+
+  // Strategy 7: Page title meta tag or <title> (cleaned up)
+  const ogTitle = document.querySelector('meta[property="og:title"]');
+  if (ogTitle) {
+    const content = ogTitle.getAttribute("content")?.trim();
+    if (content && content.length > 0 && content.length < 60) return content;
+  }
+
+  // Strategy 8: Extract from URL path for SPAs
+  const path = window.location.pathname;
+  if (path && path !== "/") {
+    const segments = path
+      .split("/")
+      .filter(Boolean)
+      .filter((s) => !/^[0-9a-f\-]{8,}$/i.test(s)) // skip UUIDs
+      .filter((s) => !/^\d+$/.test(s)); // skip numeric IDs
+    if (segments.length) {
+      return segments
+        .map((s) =>
+          s.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
+        )
+        .join(" › ");
+    }
+  }
+
+  // Strategy 9: Hash routing for SPAs
+  const hash = window.location.hash.replace(/^#\/?/, "");
+  if (hash) {
+    const segments = hash
+      .split("/")
+      .filter(Boolean)
+      .filter((s) => !/^[0-9a-f\-]{8,}$/i.test(s))
+      .filter((s) => !/^\d+$/.test(s));
+    if (segments.length) {
+      return segments
+        .map((s) =>
+          s.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
+        )
+        .join(" › ");
+    }
+  }
+
+  // Strategy 10: Fall back to document.title (cleaned)
+  const title = (document.title || "").trim();
+  if (title) {
+    const cleaned = title.split(/\s*[\-\|·»::]\s*/)[0].trim();
+    if (cleaned && cleaned.length > 0 && cleaned.length < 60) return cleaned;
+    return title.length > 60 ? title.slice(0, 60) : title;
+  }
+
+  return "Unknown Page";
+}
+
+// ── Variable context detection (expanded) ─────────────────────────────────────
+function detectVariableContext(element) {
+  if (!(element instanceof Element)) return { type: "formField" };
+
+  // ── Table context ──
+  const tableCell = element.closest("td, th");
+  const tableRow = element.closest("tr");
+  const table = element.closest("table");
+  const datagrid = element.closest(
+    '[role="grid"], [role="table"], [role="treegrid"]',
+  );
+
+  if (tableCell || datagrid) {
+    const context = {
+      type: "table",
+      rowIndex: null,
+      columnIndex: null,
+      columnHeader: null,
+    };
+
+    if (tableRow && tableCell) {
+      const cells = Array.from(tableRow.children);
+      context.columnIndex = cells.indexOf(tableCell);
+
+      if (table) {
+        const thead = table.querySelector("thead");
+        if (thead) {
+          const headerCells = thead.querySelectorAll("th, td");
+          if (context.columnIndex < headerCells.length) {
+            context.columnHeader =
+              headerCells[context.columnIndex]?.textContent?.trim() || null;
+          }
+        }
+      }
+
+      const tbody = tableRow.closest("tbody") || table;
+      if (tbody) {
+        const rows = Array.from(tbody.querySelectorAll("tr"));
+        context.rowIndex = rows.indexOf(tableRow);
+      }
+    }
+
+    return context;
+  }
+
+  // ── Modal / Dialog context ──
+  const modal = element.closest(
+    '[role="dialog"], [role="alertdialog"], .modal, .dialog, [aria-modal="true"], .MuiDialog-root, .ant-modal, .chakra-modal__content',
+  );
+  if (modal) {
+    const modalTitle =
+      modal
+        .querySelector(
+          '[role="heading"], .modal-title, .dialog-title, h1, h2, h3',
+        )
+        ?.textContent?.trim() || null;
+    return {
+      type: "modal",
+      modalTitle,
+      modalId: modal.id || null,
+      modalRole: modal.getAttribute("role") || "dialog",
+    };
+  }
+
+  // ── Sidebar / Drawer context ──
+  const sidebar = element.closest(
+    'aside, nav[role="navigation"], .sidebar, .drawer, .side-panel, [role="complementary"], .MuiDrawer-root, .ant-drawer',
+  );
+  if (sidebar) {
+    const sidebarTitle =
+      sidebar
+        .querySelector("h1, h2, h3, .sidebar-title, .drawer-title")
+        ?.textContent?.trim() || null;
+    return {
+      type: "sidebar",
+      sidebarTitle,
+      sidebarId: sidebar.id || null,
+    };
+  }
+
+  // ── Navbar / Header context ──
+  const navbar = element.closest(
+    'header, nav, [role="banner"], [role="navigation"], .navbar, .nav-bar, .header, .top-bar, .MuiAppBar-root',
+  );
+  if (navbar) {
+    return {
+      type: "navbar",
+      navbarId: navbar.id || null,
+    };
+  }
+
+  // ── Accordion / Collapsible context ──
+  const accordion = element.closest(
+    '.accordion, .collapse, .collapsible, [role="tabpanel"], .MuiAccordion-root, .ant-collapse-item, details',
+  );
+  if (accordion) {
+    const accordionTitle =
+      accordion
+        .querySelector(
+          '.accordion-header, .accordion-title, summary, [role="tab"], .MuiAccordionSummary-content, .ant-collapse-header',
+        )
+        ?.textContent?.trim() || null;
+    return {
+      type: "accordion",
+      sectionTitle: accordionTitle,
+      expanded:
+        accordion.classList.contains("show") ||
+        accordion.classList.contains("expanded") ||
+        accordion.hasAttribute("open") ||
+        accordion.getAttribute("aria-expanded") === "true",
+    };
+  }
+
+  // ── Card / Panel context ──
+  const card = element.closest(
+    '.card, .panel, .tile, .MuiCard-root, .ant-card, [role="group"], .chakra-card',
+  );
+  if (card) {
+    const cardTitle =
+      card
+        .querySelector(
+          ".card-title, .card-header, .panel-heading, .panel-title, .MuiCardHeader-title, .ant-card-head-title, h1, h2, h3, h4",
+        )
+        ?.textContent?.trim() || null;
+    return {
+      type: "card",
+      cardTitle,
+      cardId: card.id || null,
+    };
+  }
+
+  // ── Toolbar context ──
+  const toolbar = element.closest(
+    '[role="toolbar"], .toolbar, .MuiToolbar-root, .action-bar, .button-bar',
+  );
+  if (toolbar) {
+    return {
+      type: "toolbar",
+      toolbarId: toolbar.id || null,
+    };
+  }
+
+  // ── Footer context ──
+  const footer = element.closest('footer, [role="contentinfo"], .footer');
+  if (footer) {
+    return {
+      type: "footer",
+      footerId: footer.id || null,
+    };
+  }
+
+  // ── Tab panel context ──
+  const tabPanel = element.closest(
+    '[role="tabpanel"], .tab-pane, .tab-content, .MuiTabPanel-root',
+  );
+  if (tabPanel) {
+    const tabLabel =
+      tabPanel.getAttribute("aria-label") ||
+      tabPanel.getAttribute("aria-labelledby") ||
+      null;
+    let tabTitle = null;
+    if (tabLabel && !tabTitle) {
+      const labelEl = document.getElementById(tabLabel);
+      tabTitle = labelEl?.textContent?.trim() || tabLabel;
+    }
+    return {
+      type: "tabPanel",
+      tabTitle,
+      tabPanelId: tabPanel.id || null,
+    };
+  }
+
+  // ── Dropdown / Popover context ──
+  const dropdown = element.closest(
+    '.dropdown, .dropdown-menu, .popover, [role="listbox"], [role="menu"], .MuiMenu-list, .MuiPopover-root, .ant-dropdown',
+  );
+  if (dropdown) {
+    return {
+      type: "dropdown",
+      dropdownId: dropdown.id || null,
+    };
+  }
+
+  // ── Form context (default for form fields) ──
+  const form = element.closest("form");
+  if (form) {
+    const formTitle =
+      form
+        .querySelector("h1, h2, h3, h4, legend, .form-title")
+        ?.textContent?.trim() || null;
+    return {
+      type: "formField",
+      formId: form.id || null,
+      formName: form.getAttribute("name") || null,
+      formAction: form.getAttribute("action") || null,
+      formTitle,
+    };
+  }
+
+  // ── Standalone form field (no <form> wrapper) ──
+  return { type: "formField" };
+}
+
+// ── Relative XPath generation ─────────────────────────────────────────────────
+function getRelativeXPath(element) {
+  if (!(element instanceof Element)) return null;
+
+  // Strategy 1: id-based (shortest)
+  if (element.id && !/\d{5,}/.test(element.id)) {
+    return `//*[@id="${element.id}"]`;
+  }
+
+  // Strategy 2: label-based for form fields
+  if (
+    element.tagName === "INPUT" ||
+    element.tagName === "TEXTAREA" ||
+    element.tagName === "SELECT"
+  ) {
+    const type = (element.getAttribute("type") || "text").toLowerCase();
+
+    // For radio buttons — use name + value
+    if (type === "radio") {
+      const name = element.getAttribute("name");
+      const value = element.getAttribute("value");
+      if (name && value) {
+        return `//input[@name="${name}" and @value="${value}"]`;
+      }
+      if (name) {
+        // Find visible label text for this specific radio
+        const label = findLabelText(element);
+        if (label) {
+          const safeLabel = label.replace(/'/g, "\\'");
+          return `//label[contains(normalize-space(.),'${safeLabel}')]/input[@type='radio']`;
+        }
+        return `//input[@name="${name}" and @type="radio"]`;
+      }
+    }
+
+    // For checkboxes — use name + value or label
+    if (type === "checkbox") {
+      const name = element.getAttribute("name");
+      const value = element.getAttribute("value");
+      if (name && value) {
+        return `//input[@name="${name}" and @value="${value}"]`;
+      }
+      const label = findLabelText(element);
+      if (label) {
+        const safeLabel = label.replace(/'/g, "\\'");
+        return `//label[contains(normalize-space(.),'${safeLabel}')]/input[@type='checkbox']`;
+      }
+      if (name) {
+        return `//input[@name="${name}" and @type="checkbox"]`;
+      }
+    }
+
+    const labelText = findLabelText(element);
+    if (labelText) {
+      const safeLabel = labelText.replace(/'/g, "\\'");
+      const tag = element.tagName.toLowerCase();
+
+      if (element.id) {
+        return `//${tag}[@id="${element.id}"]`;
+      }
+
+      const name = element.getAttribute("name");
+      if (name) {
+        return `//${tag}[@name="${name}"]`;
+      }
+
+      const placeholder = element.getAttribute("placeholder");
+      if (placeholder) {
+        return `//${tag}[@placeholder="${placeholder}"]`;
+      }
+
+      return `//label[contains(normalize-space(.),'${safeLabel}')]/following::${tag}[1]`;
+    }
+
+    const name = element.getAttribute("name");
+    if (name && !/\d{5,}/.test(name)) {
+      return `//${element.tagName.toLowerCase()}[@name="${name}"]`;
+    }
+
+    const placeholder = element.getAttribute("placeholder");
+    if (placeholder) {
+      return `//${element.tagName.toLowerCase()}[@placeholder="${placeholder}"]`;
+    }
+  }
+
+  // Strategy 3: text-based for buttons/links
+  if (element.tagName === "BUTTON" || element.tagName === "A") {
+    const text = getDirectTextContent(element)?.trim();
+    if (text && text.length < 50) {
+      const safeText = text.replace(/'/g, "\\'");
+      const tag = element.tagName.toLowerCase();
+      return `//${tag}[normalize-space(.)='${safeText}']`;
+    }
+  }
+
+  // Strategy 4: role + text
+  const role = element.getAttribute("role");
+  if (role) {
+    const text = (element.textContent || "").trim().slice(0, 50);
+    if (text) {
+      const safeText = text.replace(/'/g, "\\'");
+      return `//*[@role="${role}" and contains(normalize-space(.),'${safeText}')]`;
+    }
+    return `//*[@role="${role}"]`;
+  }
+
+  // Strategy 5: aria-label
+  const ariaLabel = element.getAttribute("aria-label");
+  if (ariaLabel) {
+    return `//*[@aria-label="${ariaLabel}"]`;
+  }
+
+  // Strategy 6: class-based relative
+  if (element.classList.length) {
+    const mainClass = Array.from(element.classList).find(
+      (c) => !/\d{3,}/.test(c) && c.length > 2,
+    );
+    if (mainClass) {
+      const tag = element.tagName.toLowerCase();
+      return `//${tag}[contains(@class,'${mainClass}')]`;
+    }
+  }
+
+  // Strategy 7: For table cells, use row/col position
+  const td = element.closest("td, th");
+  if (td) {
+    const tr = td.closest("tr");
+    const table = td.closest("table");
+    if (tr && table) {
+      const rows = Array.from(
+        (table.querySelector("tbody") || table).querySelectorAll("tr"),
+      );
+      const rowIdx = rows.indexOf(tr) + 1;
+      const cells = Array.from(tr.children);
+      const colIdx = cells.indexOf(td) + 1;
+      const tableXPath = table.id ? `//table[@id="${table.id}"]` : "//table";
+      return `${tableXPath}//tr[${rowIdx}]/td[${colIdx}]`;
+    }
+  }
+
+  // Fallback: absolute XPath
+  return getXPath(element);
+}
+
 function buildSelectors(element) {
-  return { css: getCssSelector(element), xpath: getXPath(element) };
+  const css = getCssSelector(element);
+  const xpath = getXPath(element);
+  const relativeXPath = getRelativeXPath(element);
+  return { css, xpath, relativeXPath };
 }
 
 function getElementValue(el) {
@@ -130,6 +715,51 @@ function getElementValue(el) {
   }
   if (el.tagName === "SELECT") return el.value;
   return el.textContent?.trim() ?? null;
+}
+
+// ── Radio / Checkbox value helpers ────────────────────────────────────────────
+function getRadioSelectedLabel(element) {
+  // For a radio button, find the label text for the specific option
+  const label = findLabelText(element);
+  if (label) return label;
+
+  // Check for adjacent text node (common pattern: <input type="radio"> Male)
+  const nextSibling = element.nextSibling;
+  if (nextSibling && nextSibling.nodeType === Node.TEXT_NODE) {
+    const text = nextSibling.textContent?.trim();
+    if (text && text.length < 60) return text;
+  }
+
+  // Check next element sibling
+  const nextEl = element.nextElementSibling;
+  if (nextEl && (nextEl.tagName === "SPAN" || nextEl.tagName === "LABEL")) {
+    const text = nextEl.textContent?.trim();
+    if (text && text.length < 60) return text;
+  }
+
+  // Fallback to value attribute
+  return element.getAttribute("value") || "selected";
+}
+
+function getCheckboxLabel(element) {
+  const label = findLabelText(element);
+  if (label) return label;
+
+  const nextSibling = element.nextSibling;
+  if (nextSibling && nextSibling.nodeType === Node.TEXT_NODE) {
+    const text = nextSibling.textContent?.trim();
+    if (text && text.length < 60) return text;
+  }
+
+  const nextEl = element.nextElementSibling;
+  if (nextEl && (nextEl.tagName === "SPAN" || nextEl.tagName === "LABEL")) {
+    const text = nextEl.textContent?.trim();
+    if (text && text.length < 60) return text;
+  }
+
+  return (
+    element.getAttribute("value") || element.getAttribute("name") || "checkbox"
+  );
 }
 
 // ── Clickable ancestor resolution ─────────────────────────────────────────────
@@ -149,16 +779,15 @@ function isInputElement(el) {
 }
 
 function resolveClickTarget(rawEl) {
-  console.log(
-    "[RECORDER][resolveClickTarget] rawEl:",
-    rawEl.tagName,
-    rawEl.id || rawEl.className || "(no id/class)",
-  );
+  // For radio buttons and checkboxes, return the input itself directly
+  if (rawEl.tagName === "INPUT") {
+    const type = (rawEl.getAttribute("type") || "text").toLowerCase();
+    if (type === "radio" || type === "checkbox") {
+      return rawEl;
+    }
+  }
 
   if (isInputElement(rawEl)) {
-    console.log(
-      "[RECORDER][resolveClickTarget] → null (rawEl is input element)",
-    );
     return null;
   }
 
@@ -171,60 +800,49 @@ function resolveClickTarget(rawEl) {
       continue;
     }
     const tag = el.tagName;
-    console.log(
-      "[RECORDER][resolveClickTarget] walk step",
-      walked,
-      "→ tag:",
-      tag,
-      "id:",
-      el.id || "(none)",
-      "role:",
-      el.getAttribute("role") || "(none)",
-    );
 
-    if (tag === "BUTTON") {
-      console.log("[RECORDER][resolveClickTarget] → BUTTON found");
-      return el;
-    }
+    if (tag === "BUTTON") return el;
+
     if (tag === "A" && (el.hasAttribute("href") || el.getAttribute("role"))) {
-      console.log("[RECORDER][resolveClickTarget] → A found");
       return el;
     }
+
     if (tag === "INPUT") {
       const type = (el.getAttribute("type") || "text").toLowerCase();
-      if (CLICKABLE_INPUT_TYPES.has(type)) {
-        console.log(
-          "[RECORDER][resolveClickTarget] → clickable INPUT found:",
-          type,
-        );
-        return el;
-      }
-      console.log(
-        "[RECORDER][resolveClickTarget] → null (text INPUT found while walking)",
-      );
+      if (CLICKABLE_INPUT_TYPES.has(type)) return el;
       return null;
     }
-    if (tag === "TEXTAREA" || tag === "SELECT") {
-      console.log(
-        "[RECORDER][resolveClickTarget] → null (TEXTAREA/SELECT found while walking)",
-      );
-      return null;
-    }
+
+    if (tag === "TEXTAREA" || tag === "SELECT") return null;
+
     if (tag === "LABEL") {
+      // If label wraps or is for a radio/checkbox, resolve to that input
       const forAttr = el.getAttribute("for");
-      if (forAttr && document.getElementById(forAttr)) {
-        console.log("[RECORDER][resolveClickTarget] → null (LABEL for input)");
+      if (forAttr) {
+        const targetInput = document.getElementById(forAttr);
+        if (targetInput && targetInput.tagName === "INPUT") {
+          const inputType = (
+            targetInput.getAttribute("type") || "text"
+          ).toLowerCase();
+          if (inputType === "radio" || inputType === "checkbox") {
+            return targetInput;
+          }
+        }
+        if (targetInput) return null;
+      }
+      const wrappedInput = el.querySelector("input, textarea, select");
+      if (wrappedInput) {
+        const wrappedType = (
+          wrappedInput.getAttribute("type") || "text"
+        ).toLowerCase();
+        if (wrappedType === "radio" || wrappedType === "checkbox") {
+          return wrappedInput;
+        }
         return null;
       }
-      if (el.querySelector("input, textarea, select")) {
-        console.log(
-          "[RECORDER][resolveClickTarget] → null (LABEL wraps input)",
-        );
-        return null;
-      }
-      console.log("[RECORDER][resolveClickTarget] → LABEL (standalone)");
       return el;
     }
+
     const role = el.getAttribute("role");
     if (
       role === "button" ||
@@ -235,13 +853,11 @@ function resolveClickTarget(rawEl) {
       role === "checkbox" ||
       role === "radio"
     ) {
-      console.log("[RECORDER][resolveClickTarget] → role:", role);
       return el;
     }
-    if (el.hasAttribute("onclick")) {
-      console.log("[RECORDER][resolveClickTarget] → onclick attr found");
-      return el;
-    }
+
+    if (el.hasAttribute("onclick")) return el;
+
     el = el.parentElement;
     walked++;
   }
@@ -249,18 +865,12 @@ function resolveClickTarget(rawEl) {
   try {
     const style = window.getComputedStyle(rawEl);
     if (style.cursor === "pointer" || rawEl.hasAttribute("tabindex")) {
-      console.log(
-        "[RECORDER][resolveClickTarget] → rawEl (cursor:pointer or tabindex)",
-      );
       return rawEl;
     }
   } catch {
     /* skip */
   }
 
-  console.log(
-    "[RECORDER][resolveClickTarget] → null (nothing clickable found)",
-  );
   return null;
 }
 
@@ -338,32 +948,27 @@ function generateVariableName(element, kind) {
 // ── Step & Variable Creation ──────────────────────────────────────────────────
 function createStep(type, element, value = null) {
   if (!element) {
-    console.log("[RECORDER][createStep] → null (no element)");
     return null;
   }
-  const { css, xpath } = buildSelectors(element);
+  const { css, xpath, relativeXPath } = buildSelectors(element);
   if (!css && !xpath) {
-    console.log(
-      "[RECORDER][createStep] → null (no selectors for",
-      element.tagName,
-      ")",
-    );
     return null;
   }
+
+  const pageName = getPageName();
+  const context = detectVariableContext(element);
+
   const step = {
     type,
-    selector: { css, xpath },
+    selector: { css, xpath, relativeXPath },
     value,
     targetTag: element.tagName.toLowerCase(),
     timestamp: nowTs(),
+    pageUrl: window.location.href,
+    pageTitle: document.title || null,
+    pageName,
+    context: typeof context === "object" ? context : { type: context },
   };
-  console.log(
-    "[RECORDER][createStep] created:",
-    type,
-    css || xpath,
-    "value:",
-    value,
-  );
   return step;
 }
 
@@ -383,17 +988,57 @@ function createVariable(kind) {
     lastRightClickedElement ||
     (document.activeElement instanceof Element ? document.activeElement : null);
   if (!el) return null;
-  const { css, xpath } = buildSelectors(el);
+
+  const { css, xpath, relativeXPath } = buildSelectors(el);
   if (!css && !xpath) return null;
+
   const value = getElementValue(el);
   const name = generateVariableName(el, kind);
+  const dataType = detectDataType(el);
+  const context = detectVariableContext(el);
+  const pageName = getPageName();
+
+  let enumValues = null;
+  if (el.tagName === "SELECT") {
+    enumValues = Array.from(el.options).map((opt) => ({
+      value: opt.value,
+      label: opt.textContent?.trim() || opt.value,
+    }));
+  }
+  // For radio groups, collect all options
+  if (
+    el.tagName === "INPUT" &&
+    (el.getAttribute("type") || "").toLowerCase() === "radio"
+  ) {
+    const radioName = el.getAttribute("name");
+    if (radioName) {
+      const radios = document.querySelectorAll(
+        `input[type="radio"][name="${CSS.escape(radioName)}"]`,
+      );
+      enumValues = Array.from(radios).map((r) => {
+        const optLabel = getRadioSelectedLabel(r);
+        return {
+          value: r.getAttribute("value") || optLabel,
+          label: optLabel,
+        };
+      });
+    }
+  }
+
   return {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     kind,
     name,
-    selector: { css, xpath },
+    selector: { css, xpath, relativeXPath },
     value,
+    dataType,
+    context,
+    enumValues,
     targetTag: el.tagName.toLowerCase(),
+    inputType: el.getAttribute("type") || null,
+    pageUrl: window.location.href,
+    pageTitle: document.title || null,
+    pageName,
     createdAt: new Date().toISOString(),
   };
 }
@@ -412,12 +1057,6 @@ function compressSteps(allSteps) {
     if (!key) return true;
     return lastInputIdx.get(key) === index;
   });
-  console.log(
-    "[RECORDER][compressSteps] input:",
-    allSteps.length,
-    "→ output:",
-    result.length,
-  );
   return result;
 }
 
@@ -426,22 +1065,7 @@ function sendFlush(isFinal) {
   const compressed = compressSteps([...steps]);
   const vars = [...variables];
 
-  console.log(
-    `[RECORDER][sendFlush] isFinal=${isFinal} steps=${compressed.length} vars=${vars.length}`,
-  );
-  console.log(
-    "[RECORDER][sendFlush] step details:",
-    JSON.stringify(
-      compressed.map((s) => ({
-        type: s.type,
-        css: s.selector?.css,
-        value: s.value,
-      })),
-    ),
-  );
-
   if (!compressed.length && !vars.length) {
-    console.log("[RECORDER][sendFlush] nothing to flush — skipping");
     return Promise.resolve();
   }
 
@@ -460,11 +1084,6 @@ function sendFlush(isFinal) {
             "[RECORDER][sendFlush] chrome.runtime.lastError:",
             chrome.runtime.lastError.message,
           );
-        } else {
-          console.log(
-            "[RECORDER][sendFlush] ack received:",
-            JSON.stringify(res),
-          );
         }
         resolve(res);
       });
@@ -476,14 +1095,6 @@ function sendFlush(isFinal) {
 }
 
 function periodicFlush() {
-  console.log(
-    "[RECORDER][periodicFlush] isRecording:",
-    isRecording,
-    "steps:",
-    steps.length,
-    "vars:",
-    variables.length,
-  );
   if (!isRecording) return;
   if (!steps.length && !variables.length) return;
   sendFlush(false);
@@ -491,10 +1102,6 @@ function periodicFlush() {
 
 // ── Drain pending debounce timers ─────────────────────────────────────────────
 function drainPendingInputs() {
-  console.log(
-    "[RECORDER][drainPendingInputs] pending count:",
-    pendingInputs.size,
-  );
   for (const [key, { timeoutId, element }] of pendingInputs) {
     clearTimeout(timeoutId);
     if (element instanceof Element) {
@@ -503,25 +1110,10 @@ function drainPendingInputs() {
         const step = createStep("input", element, value);
         if (step) {
           steps.push(step);
-          console.log(
-            "[RECORDER][drainPendingInputs] drained step for:",
-            key,
-            "value:",
-            value,
-          );
         }
-      } catch (err) {
-        console.warn(
-          "[RECORDER][drainPendingInputs] error draining:",
-          key,
-          err.message,
-        );
+      } catch {
+        /* skip */
       }
-    } else {
-      console.warn(
-        "[RECORDER][drainPendingInputs] element not an Element for key:",
-        key,
-      );
     }
   }
   pendingInputs.clear();
@@ -531,62 +1123,58 @@ function drainPendingInputs() {
 
 function handleClick(event) {
   const raw = event.target;
-  console.log(
-    "[RECORDER][handleClick] FIRED — target:",
-    raw?.tagName,
-    raw?.id || raw?.className || "(no id/class)",
-    "isRecording:",
-    isRecording,
-  );
+  if (!isRecording) return;
 
-  if (!isRecording) {
-    console.log("[RECORDER][handleClick] → skipped (not recording)");
-    return;
-  }
   const rawEl = raw instanceof Element ? raw : raw?.parentElement;
-  if (!rawEl) {
-    console.log("[RECORDER][handleClick] → skipped (no rawEl)");
-    return;
-  }
-  if (isFromRecorderUi(rawEl)) {
-    console.log("[RECORDER][handleClick] → skipped (recorder UI)");
-    return;
-  }
+  if (!rawEl) return;
+  if (isFromRecorderUi(rawEl)) return;
 
   const target = resolveClickTarget(rawEl);
-  if (!target) {
-    console.log(
-      "[RECORDER][handleClick] → skipped (resolveClickTarget returned null)",
-    );
-    return;
-  }
+  if (!target) return;
 
   const { css } = buildSelectors(target);
   const now = nowTs();
   if (lastClick.selector === css && now - lastClick.time < CLICK_DEBOUNCE_MS) {
-    console.log("[RECORDER][handleClick] → skipped (debounced)");
     return;
   }
 
-  const value =
-    target.getAttribute("aria-label") ||
-    target.getAttribute("title") ||
-    target.getAttribute("name") ||
-    getDirectTextContent(target) ||
-    null;
+  // Determine if radio or checkbox
+  const isRadio =
+    target.tagName === "INPUT" &&
+    (target.getAttribute("type") || "").toLowerCase() === "radio";
+  const isCheckbox =
+    target.tagName === "INPUT" &&
+    (target.getAttribute("type") || "").toLowerCase() === "checkbox";
 
-  const step = createStep("click", target, value);
+  let value = null;
+  let stepType = "click";
+
+  if (isRadio) {
+    stepType = "select";
+    value = getRadioSelectedLabel(target);
+  } else if (isCheckbox) {
+    stepType = "check";
+    const label = getCheckboxLabel(target);
+    value = `${label}: ${target.checked ? "checked" : "unchecked"}`;
+  } else {
+    value =
+      target.getAttribute("aria-label") ||
+      target.getAttribute("title") ||
+      getDirectTextContent(target) ||
+      null;
+  }
+
+  const step = createStep(stepType, target, value);
   if (step) {
+    // Add extra metadata for radio/checkbox
+    if (isRadio || isCheckbox) {
+      step.inputType = (target.getAttribute("type") || "").toLowerCase();
+      step.checked = target.checked;
+      step.fieldName = target.getAttribute("name") || null;
+    }
+
     steps.push(step);
     lastClick = { selector: css, time: now };
-    console.log(
-      "[RECORDER][handleClick] ✅ click step ADDED — css:",
-      css,
-      "value:",
-      value,
-      "total steps:",
-      steps.length,
-    );
 
     // If this click might cause navigation, flush immediately
     const mightNavigate =
@@ -597,39 +1185,17 @@ function handleClick(event) {
       (target.tagName === "INPUT" && target.getAttribute("type") === "submit");
 
     if (mightNavigate) {
-      console.log(
-        "[RECORDER][handleClick] Navigation-likely click — draining + flushing now",
-      );
       drainPendingInputs();
       sendFlush(false);
     }
-  } else {
-    console.log("[RECORDER][handleClick] → createStep returned null");
   }
 }
 
 function handleInput(event) {
   const target = event.target;
-  console.log(
-    "[RECORDER][handleInput] FIRED — target:",
-    target?.tagName,
-    target?.id || target?.className || "(no id/class)",
-    "isRecording:",
-    isRecording,
-  );
-
-  if (!(target instanceof Element)) {
-    console.log("[RECORDER][handleInput] → skipped (not Element)");
-    return;
-  }
-  if (!isRecording) {
-    console.log("[RECORDER][handleInput] → skipped (not recording)");
-    return;
-  }
-  if (isFromRecorderUi(target)) {
-    console.log("[RECORDER][handleInput] → skipped (recorder UI)");
-    return;
-  }
+  if (!(target instanceof Element)) return;
+  if (!isRecording) return;
+  if (isFromRecorderUi(target)) return;
 
   const tag = target.tagName;
   if (
@@ -638,33 +1204,19 @@ function handleInput(event) {
     tag !== "SELECT" &&
     target.getAttribute("contenteditable") !== "true"
   ) {
-    console.log(
-      "[RECORDER][handleInput] → skipped (not input/textarea/select/contenteditable, tag:",
-      tag,
-      ")",
-    );
     return;
   }
   if (tag === "INPUT") {
     const type = (target.getAttribute("type") || "text").toLowerCase();
-    if (CLICKABLE_INPUT_TYPES.has(type)) {
-      console.log(
-        "[RECORDER][handleInput] → skipped (clickable input type:",
-        type,
-        ")",
-      );
-      return;
-    }
+    if (CLICKABLE_INPUT_TYPES.has(type)) return;
   }
 
   const { css } = buildSelectors(target);
   const key = css || target;
-  console.log("[RECORDER][handleInput] key:", key, "tag:", tag);
 
   const existing = pendingInputs.get(key);
   if (existing) {
     clearTimeout(existing.timeoutId);
-    console.log("[RECORDER][handleInput] cleared previous debounce for:", key);
   }
 
   if (tag === "SELECT") {
@@ -672,14 +1224,6 @@ function handleInput(event) {
     const step = createStep("input", target, value);
     if (step) steps.push(step);
     pendingInputs.delete(key);
-    console.log(
-      "[RECORDER][handleInput] ✅ SELECT step ADDED — key:",
-      key,
-      "value:",
-      value,
-      "total steps:",
-      steps.length,
-    );
     return;
   }
 
@@ -688,31 +1232,11 @@ function handleInput(event) {
     const step = createStep("input", target, value);
     if (step) {
       steps.push(step);
-      console.log(
-        "[RECORDER][handleInput] ✅ debounced input step ADDED — key:",
-        key,
-        "value:",
-        value,
-        "total steps:",
-        steps.length,
-      );
-    } else {
-      console.log(
-        "[RECORDER][handleInput] debounce fired but createStep returned null for:",
-        key,
-      );
     }
     pendingInputs.delete(key);
   }, INPUT_DEBOUNCE_MS);
 
   pendingInputs.set(key, { timeoutId, element: target });
-  console.log(
-    "[RECORDER][handleInput] debounce set for:",
-    key,
-    "timeout:",
-    INPUT_DEBOUNCE_MS,
-    "ms",
-  );
 }
 
 function handleBlur(event) {
@@ -732,25 +1256,14 @@ function handleBlur(event) {
   const key = css || target;
   const existing = pendingInputs.get(key);
   if (existing) {
-    // A debounce was pending — drain it now with the final value
     clearTimeout(existing.timeoutId);
     pendingInputs.delete(key);
     const value = getElementValue(target);
     const step = createStep("input", target, value);
     if (step) {
       steps.push(step);
-      console.log(
-        "[RECORDER][handleBlur] ✅ blur step ADDED — key:",
-        key,
-        "value:",
-        value,
-        "total steps:",
-        steps.length,
-      );
     }
   }
-  // If no pending debounce exists, do NOT push another step.
-  // The debounce already fired and recorded the value.
 }
 
 function handleContextMenu(event) {
@@ -763,22 +1276,12 @@ function handleContextMenu(event) {
   lastRightClickedElement = target;
 }
 
-
 function handleSubmit(event) {
   const form = event.target;
-  console.log(
-    "[RECORDER][handleSubmit] FIRED — target:",
-    form?.tagName,
-    form?.id || form?.className || "(no id/class)",
-    "isRecording:",
-    isRecording,
-  );
-
   if (!isRecording) return;
   if (!(form instanceof HTMLFormElement)) return;
   if (isFromRecorderUi(form)) return;
 
-  // Find the submit button that triggered this
   const submitBtn =
     form.querySelector('button[type="submit"]') ||
     form.querySelector('input[type="submit"]') ||
@@ -787,20 +1290,8 @@ function handleSubmit(event) {
   const target = submitBtn || form;
   const { css } = buildSelectors(target);
 
-  // If the last recorded step is already a click on this same element,
-  // skip the redundant submit step — the click already captured it.
   const lastStep = steps[steps.length - 1];
-  if (
-    lastStep &&
-    lastStep.type === "click" &&
-    lastStep.selector?.css === css
-  ) {
-    console.log(
-      "[RECORDER][handleSubmit] → skipped (click already recorded for:",
-      css,
-      ")",
-    );
-    // Still flush since navigation is about to happen
+  if (lastStep && lastStep.type === "click" && lastStep.selector?.css === css) {
     drainPendingInputs();
     sendFlush(false);
     return;
@@ -809,19 +1300,12 @@ function handleSubmit(event) {
   const value =
     target.getAttribute("aria-label") ||
     target.getAttribute("title") ||
-    target.getAttribute("name") ||
     getDirectTextContent(target) ||
     null;
 
   const step = createStep("submit", target, value);
   if (step) {
     steps.push(step);
-    console.log(
-      "[RECORDER][handleSubmit] ✅ submit step ADDED — total steps:",
-      steps.length,
-    );
-
-    // Immediately flush since navigation is about to happen
     drainPendingInputs();
     sendFlush(false);
   }
@@ -830,15 +1314,7 @@ function handleSubmit(event) {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 export function startRecording() {
-  if (isRecording) {
-    console.log(
-      "[RECORDER] startRecording() called but already recording — ignoring",
-    );
-    return;
-  }
-  console.log(
-    "[RECORDER] ▶▶▶ startRecording() — attaching listeners, resetting state",
-  );
+  if (isRecording) return;
   isRecording = true;
   steps = [];
   variables = [];
@@ -853,74 +1329,32 @@ export function startRecording() {
     document.addEventListener("contextmenu", handleContextMenu, true);
     window.addEventListener("beforeunload", handleBeforeUnload);
     listenersAttached = true;
-    console.log("[RECORDER] ✅ event listeners ATTACHED (capture phase)");
-  } else {
-    console.log(
-      "[RECORDER] event listeners already attached (listenersAttached=true)",
-    );
   }
 
   if (!flushIntervalId) {
     flushIntervalId = window.setInterval(periodicFlush, FLUSH_INTERVAL_MS);
-    console.log(
-      "[RECORDER] ✅ periodic flush started, interval:",
-      FLUSH_INTERVAL_MS,
-      "ms",
-    );
   }
 }
 
 export async function stopRecording() {
-  console.log(
-    "[RECORDER] ⏹⏹⏹ stopRecording() called — isRecording:",
-    isRecording,
-  );
-
   if (!isRecording) {
-    console.log("[RECORDER] not recording — returning empty");
     return { steps: [], variables: [] };
   }
 
   isRecording = false;
-  console.log("[RECORDER] isRecording → false");
 
   if (flushIntervalId) {
     clearInterval(flushIntervalId);
     flushIntervalId = null;
-    console.log("[RECORDER] periodic flush stopped");
   }
 
   drainPendingInputs();
-
-  console.log(
-    "[RECORDER] before final flush — steps:",
-    steps.length,
-    "variables:",
-    variables.length,
-  );
-  console.log(
-    "[RECORDER] steps array:",
-    JSON.stringify(
-      steps.map((s) => ({
-        type: s.type,
-        css: s.selector?.css,
-        value: s.value,
-      })),
-    ),
-  );
-
   await sendFlush(true);
 
   const result = {
     steps: compressSteps([...steps]),
     variables: [...variables],
   };
-  console.log(
-    "[RECORDER] stopRecording result — steps:",
-    result.steps.length,
-    "vars:",
-    result.variables.length,
-  );
 
   steps = [];
   variables = [];

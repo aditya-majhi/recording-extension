@@ -320,19 +320,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   );
 
   if (type === "RECORDER_FLUSH") {
-    console.log(
-      "[BG] RECORDER_FLUSH — isFinal:",
-      message.isFinal,
-      "steps:",
-      message.steps?.length,
-      "vars:",
-      message.variables?.length,
-    );
-    console.log(
-      "[BG] RECORDER_FLUSH — currentRecording exists:",
-      !!currentRecording,
-    );
-
     if (currentRecording) {
       const {
         steps: newSteps = [],
@@ -340,105 +327,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         isFinal = false,
       } = message;
 
-      if (isFinal) {
-        if (Array.isArray(newSteps) && newSteps.length) {
-          currentRecording.steps = deduplicateInputSteps([
-            ...currentRecording.steps,
-            ...newSteps,
-          ]);
-          console.log(
-            "[BG] ✅ Final flush — appended + deduplicated, total:",
-            currentRecording.steps.length,
-          );
-        } else {
-          // Still deduplicate existing steps in case mid-flushes left duplicates
-          currentRecording.steps = deduplicateInputSteps(
-            currentRecording.steps,
-          );
-          console.log(
-            "[BG] ✅ Final flush — no new steps, deduplicated existing to",
-            currentRecording.steps.length,
-            "steps",
-          );
-        }
-        // Use mergeVariables to prevent duplicate variables on final flush
-        if (Array.isArray(newVars) && newVars.length) {
-          currentRecording.variables = mergeVariables(
-            currentRecording.variables,
-            newVars,
-          );
-          console.log(
-            "[BG] ✅ Final flush — merged variables, total:",
-            currentRecording.variables.length,
-          );
-        }
-        currentRecording.finalFlushReceived = true;
-        console.log("[BG] ✅ finalFlushReceived = true");
-      } else {
-        if (
-          Array.isArray(newSteps) &&
-          newSteps.length > currentRecording.steps.length
-        ) {
-          currentRecording.steps = deduplicateInputSteps(newSteps);
-          console.log(
-            "[BG] Mid-flush — replaced + deduplicated to",
-            currentRecording.steps.length,
-            "steps",
-          );
-        } else if (
-          Array.isArray(newSteps) &&
-          newSteps.length > 0 &&
-          newSteps.length <= currentRecording.steps.length
-        ) {
-          const existingCssKeys = new Set(
-            currentRecording.steps.map(
-              (s) => `${s.type}:${s.selector?.css}:${s.value}`,
-            ),
-          );
-          const brandNew = newSteps.filter(
-            (s) =>
-              !existingCssKeys.has(`${s.type}:${s.selector?.css}:${s.value}`),
-          );
-          if (brandNew.length) {
-            currentRecording.steps = deduplicateInputSteps([
-              ...currentRecording.steps,
-              ...brandNew,
-            ]);
-            console.log(
-              "[BG] Mid-flush — appended + deduplicated, total:",
-              currentRecording.steps.length,
-            );
-          } else {
-            console.log(
-              "[BG] Mid-flush — no new steps to add, keeping",
-              currentRecording.steps.length,
-            );
-          }
-        } else {
-          console.log(
-            "[BG] Mid-flush — content sent 0 steps, keeping existing",
-            currentRecording.steps.length,
-          );
-        }
-        // Use mergeVariables for mid-flush too (already was deduping, now consistent)
-        if (Array.isArray(newVars) && newVars.length) {
-          currentRecording.variables = mergeVariables(
-            currentRecording.variables,
-            newVars,
-          );
-        }
+      // ALWAYS replace steps — content script sends the full compressed array each time
+      if (Array.isArray(newSteps) && newSteps.length) {
+        currentRecording.steps = deduplicateInputSteps(newSteps);
+        console.log(
+          "[BG] RECORDER_FLUSH — replaced steps, total:",
+          currentRecording.steps.length,
+          "isFinal:",
+          isFinal,
+        );
       }
 
-      console.log(
-        "[BG] currentRecording.steps NOW:",
-        currentRecording.steps.length,
-      );
-      console.log(
-        "[BG] currentRecording.variables NOW:",
-        currentRecording.variables.length,
-      );
-    } else {
-      console.warn("[BG] ⚠ RECORDER_FLUSH received but NO currentRecording!");
+      // Merge variables by id (never duplicate)
+      if (Array.isArray(newVars) && newVars.length) {
+        currentRecording.variables = mergeVariables(
+          currentRecording.variables,
+          newVars,
+        );
+      }
+
+      if (isFinal) {
+        currentRecording.finalFlushReceived = true;
+        console.log(
+          "[BG] ✅ finalFlushReceived = true, steps:",
+          currentRecording.steps.length,
+        );
+      }
     }
     sendResponse({ success: true });
     return;
