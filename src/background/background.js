@@ -80,6 +80,11 @@ chrome.runtime.onInstalled.addListener(() => {
     title: "Save as Output Variable",
     contexts: ["all"],
   });
+  chrome.contextMenus.create({
+    id: "var-button",
+    title: "Save as Button Variable",
+    contexts: ["all"],
+  });
 });
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
@@ -97,6 +102,14 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
       type: "CREATE_VARIABLE",
       kind: "output",
     });
+    return;
+  }
+  if (info.menuItemId === "var-button") {
+    chrome.tabs.sendMessage(tab.id, {
+      type: "CREATE_VARIABLE",
+      kind: "button",
+    });
+    return;
   }
 });
 

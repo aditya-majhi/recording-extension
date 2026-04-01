@@ -5,6 +5,8 @@ let listenersAttached = false;
 let lastClick = { selector: null, time: 0 };
 let lastRightClickedElement = null;
 let flushIntervalId = null;
+let currentPageName = null;
+let routeObserverCleanup = null;
 
 const pendingInputs = new Map();
 
@@ -202,9 +204,53 @@ function detectDataType(element) {
   return "string";
 }
 
-// ── Page name extraction ──────────────────────────────────────────────────────
-function getPageName() {
-  // Strategy 1: Breadcrumb — last item is usually the current page
+// ── Brand name detection ──────────────────────────────────────────────────────
+function detectBrandNames() {
+  const brands = new Set();
+
+  const brandEl = document.querySelector(
+    ".navbar-brand, .brand, .site-title, .app-name, .app-title, " +
+      "header .logo-text, [class*='brand'], [class*='logo'] span, " +
+      "[class*='logo'] a",
+  );
+  if (brandEl) {
+    const text = (brandEl.textContent || "").trim().toLowerCase();
+    if (text && text.length < 40) brands.add(text);
+  }
+
+  const appNameMeta = document.querySelector('meta[name="application-name"]');
+  if (appNameMeta) {
+    const content = (appNameMeta.getAttribute("content") || "")
+      .trim()
+      .toLowerCase();
+    if (content) brands.add(content);
+  }
+
+  const title = (document.title || "").trim();
+  const parts = title.split(/\s*[-\|·»::]\s*/);
+  if (parts.length > 1) {
+    brands.add(parts[parts.length - 1].trim().toLowerCase());
+  }
+
+  return brands;
+}
+
+// ── Page name extraction (scored candidates) ──────────────────────────────────
+function detectBestPageName() {
+  const candidates = [];
+  const brands = detectBrandNames();
+
+  function addCandidate(text, score, source) {
+    if (!text || typeof text !== "string") return;
+    const trimmed = text.trim();
+    if (!trimmed || trimmed.length === 0 || trimmed.length > 60) return;
+    if (brands.has(trimmed.toLowerCase())) {
+      score -= 50;
+    }
+    candidates.push({ text: trimmed, score, source });
+  }
+
+  // Strategy 1: Breadcrumb (highest confidence)
   const breadcrumb = document.querySelector(
     '[aria-label="breadcrumb"], .breadcrumb, .breadcrumbs, nav.breadcrumb, ol.breadcrumb, [role="navigation"][aria-label*="breadcrumb" i]',
   );
@@ -213,21 +259,17 @@ function getPageName() {
       "li, a, span, .breadcrumb-item, [aria-current]",
     );
     if (items.length) {
-      // Prefer the item with aria-current="page"
       for (const item of items) {
         if (item.getAttribute("aria-current") === "page") {
-          const text = item.textContent?.trim();
-          if (text && text.length > 0 && text.length < 60) return text;
+          addCandidate(item.textContent, 95, "breadcrumb-current");
         }
       }
-      // Otherwise use the last breadcrumb item
       const last = items[items.length - 1];
-      const text = last.textContent?.trim();
-      if (text && text.length > 0 && text.length < 60) return text;
+      addCandidate(last.textContent, 90, "breadcrumb-last");
     }
   }
 
-  // Strategy 2: Active nav/tab/sidebar item — indicates current section
+  // Strategy 2: Active nav/tab/sidebar item
   const activeNavItem = document.querySelector(
     'nav a.active, nav a[aria-current="page"], nav .active > a, ' +
       '.sidebar a.active, .sidebar .active > a, .sidebar a[aria-current="page"], ' +
@@ -238,30 +280,89 @@ function getPageName() {
       "a.router-link-active, a.router-link-exact-active",
   );
   if (activeNavItem) {
-    const text = activeNavItem.textContent?.trim();
-    if (text && text.length > 0 && text.length < 60) return text;
+    addCandidate(activeNavItem.textContent, 85, "activeNav");
   }
 
-  // Strategy 3: Page-level heading (h1 directly under main/body, not inside cards/modals)
+  // Strategy 2b: Active sidebar item (non-anchor UIs)
+  const activeSidebarItem = document.querySelector(
+    '.sidebar .active, aside .active, [role="navigation"] .active, ' +
+      '.sidebar [aria-current="page"], [role="navigation"] [aria-current="page"], ' +
+      '.sidebar [data-active="true"], [role="navigation"] [data-active="true"], ' +
+      '.sidebar [aria-selected="true"], [role="navigation"] [aria-selected="true"]',
+  );
+  if (activeSidebarItem) {
+    addCandidate(activeSidebarItem.textContent, 88, "activeSidebarItem");
+  }
+
+  // Strategy 3: Page-level heading under main content
   const mainContent = document.querySelector(
-    'main, [role="main"], #content, #main, .main-content, .page-content, .content-area',
+    "main, [role='main'], #content, #main, .main-content, .page-content, .content-area, " +
+      "#root main, #root [class*='content'], #root [class*='page'], .layout-content, .app-content",
   );
   if (mainContent) {
-    // Direct h1/h2 child or shallow descendant of main
     const heading = mainContent.querySelector(
       ":scope > h1, :scope > h2, :scope > header h1, :scope > header h2, " +
-        ":scope > div > h1, :scope > div > h2, :scope > .page-header h1, :scope > .page-title",
+        ":scope > div > h1, :scope > div > h2, :scope > .page-header h1, :scope > .page-title, " +
+        ":scope > [class*='title'], :scope > [class*='heading']",
     );
     if (heading) {
-      const text = heading.textContent?.trim();
-      if (text && text.length > 0 && text.length < 60) return text;
+      addCandidate(heading.textContent, 80, "mainHeading");
     }
   }
 
-  // Strategy 4: First visible h1 that is NOT inside a modal, card, sidebar, or accordion
+  // Strategy 3a: Action button labels (primary CTA often names the current view)
+  const actionRoot = mainContent || document.body;
+  const actionBtns = actionRoot.querySelectorAll(
+    'button[type="submit"], .btn-primary, .primary, ' +
+      ".ant-btn-primary, .MuiButton-containedPrimary, " +
+      '[class*="btn-primary"], [class*="primary-btn"]',
+  );
+  for (const btn of actionBtns) {
+    const rect = btn.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    const label = (
+      btn.textContent ||
+      btn.getAttribute("aria-label") ||
+      btn.getAttribute("value") ||
+      ""
+    ).trim();
+    if (label.length >= 3 && label.length <= 40) {
+      if (
+        !/^(cancel|close|back|ok|yes|no|submit|save|delete|remove|confirm|reset|edit|update)$/i.test(
+          label,
+        )
+      ) {
+        addCandidate(label, 68, "actionButtonLabel");
+        break;
+      }
+    }
+  }
+
+  // Strategy 3b: Visible section title inside main content
+  const sectionRoot = mainContent || document.body;
+  const sections = sectionRoot.querySelectorAll(
+    "section, article, [role='region'], fieldset, " +
+      ".section, .panel, .content-section",
+  );
+  for (const section of sections) {
+    const rect = section.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    const heading = section.querySelector(
+      "h1, h2, h3, legend, .section-title, .panel-title, " +
+        "[class*='section-title'], [class*='panel-title']",
+    );
+    if (heading) {
+      const text = (heading.textContent || "").trim();
+      if (text.length > 1 && text.length <= 60) {
+        addCandidate(text, 64, "visibleSectionTitle");
+        break;
+      }
+    }
+  }
+
+  // Strategy 4: First visible h1 not inside overlay containers
   const allH1s = document.querySelectorAll("h1");
   for (const h1 of allH1s) {
-    // Skip headings inside overlay/widget containers
     if (
       h1.closest(
         '[role="dialog"], [aria-modal="true"], .modal, .card, .sidebar, ' +
@@ -270,14 +371,13 @@ function getPageName() {
     ) {
       continue;
     }
-    // Skip hidden headings
     const rect = h1.getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) continue;
-    const text = h1.textContent?.trim();
-    if (text && text.length > 0 && text.length < 60) return text;
+    addCandidate(h1.textContent, 70, "h1");
+    break;
   }
 
-  // Strategy 5: First visible h2 (same exclusions)
+  // Strategy 5: First visible h2
   const allH2s = document.querySelectorAll("h2");
   for (const h2 of allH2s) {
     if (
@@ -290,41 +390,41 @@ function getPageName() {
     }
     const rect = h2.getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) continue;
-    const text = h2.textContent?.trim();
-    if (text && text.length > 0 && text.length < 60) return text;
+    addCandidate(h2.textContent, 55, "h2");
+    break;
   }
 
   // Strategy 6: aria-label on main/content region
   if (mainContent) {
     const ariaLabel = mainContent.getAttribute("aria-label");
-    if (ariaLabel && ariaLabel.length < 60) return ariaLabel;
+    if (ariaLabel) addCandidate(ariaLabel, 50, "ariaLabel");
   }
 
-  // Strategy 7: Page title meta tag or <title> (cleaned up)
+  // Strategy 7: og:title meta tag
   const ogTitle = document.querySelector('meta[property="og:title"]');
   if (ogTitle) {
-    const content = ogTitle.getAttribute("content")?.trim();
-    if (content && content.length > 0 && content.length < 60) return content;
+    addCandidate(ogTitle.getAttribute("content"), 40, "ogTitle");
   }
 
-  // Strategy 8: Extract from URL path for SPAs
+  // Strategy 8: URL path
   const path = window.location.pathname;
   if (path && path !== "/") {
     const segments = path
       .split("/")
       .filter(Boolean)
-      .filter((s) => !/^[0-9a-f\-]{8,}$/i.test(s)) // skip UUIDs
-      .filter((s) => !/^\d+$/.test(s)); // skip numeric IDs
+      .filter((s) => !/^[0-9a-f\-]{8,}$/i.test(s))
+      .filter((s) => !/^\d+$/.test(s));
     if (segments.length) {
-      return segments
+      const urlName = segments
         .map((s) =>
           s.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
         )
         .join(" › ");
+      addCandidate(urlName, 35, "urlPath");
     }
   }
 
-  // Strategy 9: Hash routing for SPAs
+  // Strategy 9: Hash routing
   const hash = window.location.hash.replace(/^#\/?/, "");
   if (hash) {
     const segments = hash
@@ -333,30 +433,139 @@ function getPageName() {
       .filter((s) => !/^[0-9a-f\-]{8,}$/i.test(s))
       .filter((s) => !/^\d+$/.test(s));
     if (segments.length) {
-      return segments
+      const hashName = segments
         .map((s) =>
           s.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
         )
         .join(" › ");
+      addCandidate(hashName, 30, "hashPath");
     }
   }
 
-  // Strategy 10: Fall back to document.title (cleaned)
+  // Strategy 10: document.title (first part before separator)
   const title = (document.title || "").trim();
   if (title) {
-    const cleaned = title.split(/\s*[\-\|·»::]\s*/)[0].trim();
-    if (cleaned && cleaned.length > 0 && cleaned.length < 60) return cleaned;
-    return title.length > 60 ? title.slice(0, 60) : title;
+    const cleaned = title.split(/\s*[-\|·»::]\s*/)[0].trim();
+    if (cleaned) {
+      addCandidate(cleaned, 25, "documentTitle");
+    }
   }
 
-  return "Unknown Page";
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates.length > 0 ? candidates[0].text : "Unknown Page";
+}
+
+function getPageName() {
+  const fresh = detectBestPageName();
+  if (fresh && fresh !== "Unknown Page") currentPageName = fresh;
+  return currentPageName || fresh || "Unknown Page";
+}
+
+// ── SPA Route Observer ────────────────────────────────────────────────────────
+function attachRouteObserver() {
+  if (routeObserverCleanup) return;
+
+  const originalPushState = history.pushState;
+  const originalReplaceState = history.replaceState;
+
+  const onRouteChange = () => {
+    [0, 150, 500, 1200].forEach((delay) => {
+      setTimeout(() => {
+        currentPageName = detectBestPageName();
+      }, delay);
+    });
+  };
+
+  history.pushState = function (...args) {
+    originalPushState.apply(this, args);
+    onRouteChange();
+  };
+
+  history.replaceState = function (...args) {
+    originalReplaceState.apply(this, args);
+    onRouteChange();
+  };
+
+  window.addEventListener("popstate", onRouteChange);
+  window.addEventListener("hashchange", onRouteChange);
+
+  routeObserverCleanup = () => {
+    history.pushState = originalPushState;
+    history.replaceState = originalReplaceState;
+    window.removeEventListener("popstate", onRouteChange);
+    window.removeEventListener("hashchange", onRouteChange);
+    routeObserverCleanup = null;
+  };
+}
+
+function detachRouteObserver() {
+  if (routeObserverCleanup) routeObserverCleanup();
+}
+
+// ── Button / clickable input guard ────────────────────────────────────────────
+function shouldIgnoreAsInputTarget(el) {
+  if (!el || !(el instanceof Element)) return true;
+  if (el.tagName === "BUTTON") return true;
+  if (el.tagName === "INPUT") {
+    const type = (el.getAttribute("type") || "text").toLowerCase();
+    if (CLICKABLE_INPUT_TYPES.has(type)) return true;
+  }
+  if (el.getAttribute("role") === "button") return true;
+  return false;
+}
+
+// ── Button Data Extraction ────────────────────────────────────────────────────
+function getButtonData(element) {
+  if (!element || !(element instanceof Element)) return null;
+
+  const isButton =
+    element.tagName === "BUTTON" ||
+    element.getAttribute("role") === "button" ||
+    (element.tagName === "INPUT" &&
+      CLICKABLE_INPUT_TYPES.has(
+        (element.getAttribute("type") || "text").toLowerCase(),
+      ));
+
+  if (!isButton) return null;
+
+  let text = getDirectTextContent(element)?.trim() || "";
+  if (!text && element.tagName === "BUTTON") {
+    text = element.textContent?.trim() || "";
+  }
+  if (!text) {
+    text = element.getAttribute("aria-label") || "";
+  }
+  if (!text) {
+    text = element.getAttribute("title") || "";
+  }
+
+  const value = element.getAttribute("value") || null;
+  const buttonType = element.getAttribute("type") || "button";
+  const name = element.getAttribute("name") || null;
+
+  const dataAttrs = {};
+  for (const attr of element.attributes) {
+    if (attr.name.startsWith("data-")) {
+      dataAttrs[attr.name] = attr.value;
+    }
+  }
+
+  return {
+    text,
+    value,
+    buttonType,
+    name,
+    dataAttrs: Object.keys(dataAttrs).length > 0 ? dataAttrs : null,
+    ariaLabel: element.getAttribute("aria-label") || null,
+    title: element.getAttribute("title") || null,
+    className: element.className || null,
+  };
 }
 
 // ── Variable context detection (expanded) ─────────────────────────────────────
 function detectVariableContext(element) {
   if (!(element instanceof Element)) return { type: "formField" };
 
-  // ── Table context ──
   const tableCell = element.closest("td, th");
   const tableRow = element.closest("tr");
   const table = element.closest("table");
@@ -397,7 +606,6 @@ function detectVariableContext(element) {
     return context;
   }
 
-  // ── Modal / Dialog context ──
   const modal = element.closest(
     '[role="dialog"], [role="alertdialog"], .modal, .dialog, [aria-modal="true"], .MuiDialog-root, .ant-modal, .chakra-modal__content',
   );
@@ -416,7 +624,6 @@ function detectVariableContext(element) {
     };
   }
 
-  // ── Sidebar / Drawer context ──
   const sidebar = element.closest(
     'aside, nav[role="navigation"], .sidebar, .drawer, .side-panel, [role="complementary"], .MuiDrawer-root, .ant-drawer',
   );
@@ -432,7 +639,6 @@ function detectVariableContext(element) {
     };
   }
 
-  // ── Navbar / Header context ──
   const navbar = element.closest(
     'header, nav, [role="banner"], [role="navigation"], .navbar, .nav-bar, .header, .top-bar, .MuiAppBar-root',
   );
@@ -443,7 +649,6 @@ function detectVariableContext(element) {
     };
   }
 
-  // ── Accordion / Collapsible context ──
   const accordion = element.closest(
     '.accordion, .collapse, .collapsible, [role="tabpanel"], .MuiAccordion-root, .ant-collapse-item, details',
   );
@@ -465,7 +670,6 @@ function detectVariableContext(element) {
     };
   }
 
-  // ── Card / Panel context ──
   const card = element.closest(
     '.card, .panel, .tile, .MuiCard-root, .ant-card, [role="group"], .chakra-card',
   );
@@ -483,7 +687,6 @@ function detectVariableContext(element) {
     };
   }
 
-  // ── Toolbar context ──
   const toolbar = element.closest(
     '[role="toolbar"], .toolbar, .MuiToolbar-root, .action-bar, .button-bar',
   );
@@ -494,7 +697,6 @@ function detectVariableContext(element) {
     };
   }
 
-  // ── Footer context ──
   const footer = element.closest('footer, [role="contentinfo"], .footer');
   if (footer) {
     return {
@@ -503,7 +705,6 @@ function detectVariableContext(element) {
     };
   }
 
-  // ── Tab panel context ──
   const tabPanel = element.closest(
     '[role="tabpanel"], .tab-pane, .tab-content, .MuiTabPanel-root',
   );
@@ -524,7 +725,6 @@ function detectVariableContext(element) {
     };
   }
 
-  // ── Dropdown / Popover context ──
   const dropdown = element.closest(
     '.dropdown, .dropdown-menu, .popover, [role="listbox"], [role="menu"], .MuiMenu-list, .MuiPopover-root, .ant-dropdown',
   );
@@ -535,7 +735,18 @@ function detectVariableContext(element) {
     };
   }
 
-  // ── Form context (default for form fields) ──
+  const isActionControl =
+    element.tagName === "BUTTON" ||
+    (element.tagName === "INPUT" &&
+      ["submit", "button", "reset"].includes(
+        (element.getAttribute("type") || "").toLowerCase(),
+      )) ||
+    element.getAttribute("role") === "button";
+
+  if (isActionControl) {
+    return { type: "button" };
+  }
+
   const form = element.closest("form");
   if (form) {
     const formTitle =
@@ -551,7 +762,6 @@ function detectVariableContext(element) {
     };
   }
 
-  // ── Standalone form field (no <form> wrapper) ──
   return { type: "formField" };
 }
 
@@ -559,12 +769,10 @@ function detectVariableContext(element) {
 function getRelativeXPath(element) {
   if (!(element instanceof Element)) return null;
 
-  // Strategy 1: id-based (shortest)
   if (element.id && !/\d{5,}/.test(element.id)) {
     return `//*[@id="${element.id}"]`;
   }
 
-  // Strategy 2: label-based for form fields
   if (
     element.tagName === "INPUT" ||
     element.tagName === "TEXTAREA" ||
@@ -572,7 +780,6 @@ function getRelativeXPath(element) {
   ) {
     const type = (element.getAttribute("type") || "text").toLowerCase();
 
-    // For radio buttons — use name + value
     if (type === "radio") {
       const name = element.getAttribute("name");
       const value = element.getAttribute("value");
@@ -580,7 +787,6 @@ function getRelativeXPath(element) {
         return `//input[@name="${name}" and @value="${value}"]`;
       }
       if (name) {
-        // Find visible label text for this specific radio
         const label = findLabelText(element);
         if (label) {
           const safeLabel = label.replace(/'/g, "\\'");
@@ -590,7 +796,6 @@ function getRelativeXPath(element) {
       }
     }
 
-    // For checkboxes — use name + value or label
     if (type === "checkbox") {
       const name = element.getAttribute("name");
       const value = element.getAttribute("value");
@@ -640,7 +845,6 @@ function getRelativeXPath(element) {
     }
   }
 
-  // Strategy 3: text-based for buttons/links
   if (element.tagName === "BUTTON" || element.tagName === "A") {
     const text = getDirectTextContent(element)?.trim();
     if (text && text.length < 50) {
@@ -650,7 +854,6 @@ function getRelativeXPath(element) {
     }
   }
 
-  // Strategy 4: role + text
   const role = element.getAttribute("role");
   if (role) {
     const text = (element.textContent || "").trim().slice(0, 50);
@@ -661,13 +864,11 @@ function getRelativeXPath(element) {
     return `//*[@role="${role}"]`;
   }
 
-  // Strategy 5: aria-label
   const ariaLabel = element.getAttribute("aria-label");
   if (ariaLabel) {
     return `//*[@aria-label="${ariaLabel}"]`;
   }
 
-  // Strategy 6: class-based relative
   if (element.classList.length) {
     const mainClass = Array.from(element.classList).find(
       (c) => !/\d{3,}/.test(c) && c.length > 2,
@@ -678,7 +879,6 @@ function getRelativeXPath(element) {
     }
   }
 
-  // Strategy 7: For table cells, use row/col position
   const td = element.closest("td, th");
   if (td) {
     const tr = td.closest("tr");
@@ -695,8 +895,15 @@ function getRelativeXPath(element) {
     }
   }
 
-  // Fallback: absolute XPath
-  return getXPath(element);
+  const tag = element.tagName.toLowerCase();
+  const text = getDirectTextContent(element)?.trim();
+  if (text) {
+    const safe = text.replace(/'/g, "\\'");
+    return `//${tag}[normalize-space(.)='${safe}']`;
+  }
+  const name = element.getAttribute("name");
+  if (name) return `//${tag}[@name="${name}"]`;
+  return `//${tag}`;
 }
 
 function buildSelectors(element) {
@@ -719,25 +926,21 @@ function getElementValue(el) {
 
 // ── Radio / Checkbox value helpers ────────────────────────────────────────────
 function getRadioSelectedLabel(element) {
-  // For a radio button, find the label text for the specific option
   const label = findLabelText(element);
   if (label) return label;
 
-  // Check for adjacent text node (common pattern: <input type="radio"> Male)
   const nextSibling = element.nextSibling;
   if (nextSibling && nextSibling.nodeType === Node.TEXT_NODE) {
     const text = nextSibling.textContent?.trim();
     if (text && text.length < 60) return text;
   }
 
-  // Check next element sibling
   const nextEl = element.nextElementSibling;
   if (nextEl && (nextEl.tagName === "SPAN" || nextEl.tagName === "LABEL")) {
     const text = nextEl.textContent?.trim();
     if (text && text.length < 60) return text;
   }
 
-  // Fallback to value attribute
   return element.getAttribute("value") || "selected";
 }
 
@@ -779,7 +982,6 @@ function isInputElement(el) {
 }
 
 function resolveClickTarget(rawEl) {
-  // For radio buttons and checkboxes, return the input itself directly
   if (rawEl.tagName === "INPUT") {
     const type = (rawEl.getAttribute("type") || "text").toLowerCase();
     if (type === "radio" || type === "checkbox") {
@@ -816,7 +1018,6 @@ function resolveClickTarget(rawEl) {
     if (tag === "TEXTAREA" || tag === "SELECT") return null;
 
     if (tag === "LABEL") {
-      // If label wraps or is for a radio/checkbox, resolve to that input
       const forAttr = el.getAttribute("for");
       if (forAttr) {
         const targetInput = document.getElementById(forAttr);
@@ -830,6 +1031,7 @@ function resolveClickTarget(rawEl) {
         }
         if (targetInput) return null;
       }
+
       const wrappedInput = el.querySelector("input, textarea, select");
       if (wrappedInput) {
         const wrappedType = (
@@ -840,7 +1042,8 @@ function resolveClickTarget(rawEl) {
         }
         return null;
       }
-      return el;
+
+      return null;
     }
 
     const role = el.getAttribute("role");
@@ -862,13 +1065,13 @@ function resolveClickTarget(rawEl) {
     walked++;
   }
 
-  try {
-    const style = window.getComputedStyle(rawEl);
-    if (style.cursor === "pointer" || rawEl.hasAttribute("tabindex")) {
-      return rawEl;
-    }
-  } catch {
-    /* skip */
+  if (
+    rawEl.tagName === "BUTTON" ||
+    rawEl.tagName === "A" ||
+    rawEl.getAttribute("role") === "button" ||
+    rawEl.hasAttribute("onclick")
+  ) {
+    return rawEl;
   }
 
   return null;
@@ -921,6 +1124,22 @@ function findLabelText(element) {
 }
 
 function generateVariableName(element, kind) {
+  const buttonData = getButtonData(element);
+  if (kind === "button" || buttonData) {
+    const raw =
+      buttonData?.text ||
+      element.getAttribute("aria-label") ||
+      element.getAttribute("title") ||
+      element.getAttribute("value") ||
+      "";
+    const cleaned = raw.replace(/[^a-zA-Z0-9\s]/g, " ").trim();
+    const tokens = cleaned.split(/\s+/).filter(Boolean);
+    if (tokens.length) {
+      return `bt_${tokens.join("_")}`.slice(0, 60);
+    }
+    return "bt_button";
+  }
+
   const label = findLabelText(element);
   const prefix = kind === "output" ? "out" : "in";
   if (label) {
@@ -951,7 +1170,7 @@ function createStep(type, element, value = null) {
     return null;
   }
   const { css, xpath, relativeXPath } = buildSelectors(element);
-  if (!css && !xpath) {
+  if (!css && !xpath && !relativeXPath) {
     return null;
   }
 
@@ -969,6 +1188,16 @@ function createStep(type, element, value = null) {
     pageName,
     context: typeof context === "object" ? context : { type: context },
   };
+
+  const buttonData = getButtonData(element);
+  if (buttonData) {
+    step.buttonValue =
+      buttonData.text ||
+      buttonData.value ||
+      getDirectTextContent(element) ||
+      null;
+  }
+
   return step;
 }
 
@@ -983,6 +1212,26 @@ function getDirectTextContent(el) {
   return trimmed || null;
 }
 
+function buildVariableSavedStep(variable) {
+  return {
+    type: "store_variable",
+    selector: variable.selector || null,
+    value: null,
+    variableName: variable.name,
+    variableKind: variable.kind,
+    variableValue: variable.value ?? null,
+    targetTag: variable.targetTag || null,
+    timestamp: nowTs(),
+    pageUrl: variable.pageUrl || window.location.href,
+    pageTitle: variable.pageTitle || document.title || null,
+    pageName: variable.pageName || getPageName(),
+    context:
+      typeof variable.context === "object"
+        ? variable.context
+        : { type: variable.context || "formField" },
+  };
+}
+
 function createVariable(kind) {
   const el =
     lastRightClickedElement ||
@@ -990,13 +1239,40 @@ function createVariable(kind) {
   if (!el) return null;
 
   const { css, xpath, relativeXPath } = buildSelectors(el);
-  if (!css && !xpath) return null;
+  if (!css && !xpath && !relativeXPath) return null;
 
-  const value = getElementValue(el);
-  const name = generateVariableName(el, kind);
+  const buttonData = getButtonData(el);
+  const isButtonVariable = kind === "button" || buttonData !== null;
+
+  const baseValue = getElementValue(el);
   const dataType = detectDataType(el);
-  const context = detectVariableContext(el);
+  const context = isButtonVariable
+    ? { type: "button" }
+    : detectVariableContext(el);
   const pageName = getPageName();
+
+  const suggestedName = generateVariableName(el, kind);
+  const clickedSvg =
+    el.tagName.toLowerCase() === "svg" || !!el.querySelector("svg");
+  const defaultPromptValue = clickedSvg ? "" : suggestedName;
+  const userInput = window.prompt("Variable name", defaultPromptValue);
+
+  if (userInput === null) return null;
+  const rawName = userInput.trim() || suggestedName || "var_button";
+  const finalName =
+    rawName
+      .replace(/\s+/g, "_")
+      .replace(/[^\w]/g, "_")
+      .replace(/_+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 80) || "var_button";
+
+  const captureText = (el.textContent || "").trim().slice(0, 200);
+  const captureValue = getElementValue(el);
+  const capture = {
+    text: captureText || null,
+    value: captureValue != null ? captureValue : null,
+  };
 
   let enumValues = null;
   if (el.tagName === "SELECT") {
@@ -1005,7 +1281,6 @@ function createVariable(kind) {
       label: opt.textContent?.trim() || opt.value,
     }));
   }
-  // For radio groups, collect all options
   if (
     el.tagName === "INPUT" &&
     (el.getAttribute("type") || "").toLowerCase() === "radio"
@@ -1025,15 +1300,16 @@ function createVariable(kind) {
     }
   }
 
-  return {
+  const variable = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     kind,
-    name,
+    name: finalName,
     selector: { css, xpath, relativeXPath },
-    value,
+    value: baseValue,
     dataType,
     context,
     enumValues,
+    capture,
     targetTag: el.tagName.toLowerCase(),
     inputType: el.getAttribute("type") || null,
     pageUrl: window.location.href,
@@ -1041,6 +1317,26 @@ function createVariable(kind) {
     pageName,
     createdAt: new Date().toISOString(),
   };
+
+  if (isButtonVariable) {
+    variable.kind = "button";
+    variable.context = { type: "button" };
+    variable.isButton = true;
+    variable.buttonData = buttonData;
+    variable.dataType = "button";
+    variable.value =
+      buttonData?.text ||
+      buttonData?.value ||
+      getDirectTextContent(el) ||
+      getElementValue(el) ||
+      null;
+    variable.capture = {
+      text: variable.value != null ? String(variable.value) : null,
+      value: variable.value,
+    };
+  }
+
+  return variable;
 }
 
 // ── Compress: keep only last input step per selector ─────────────────────────
@@ -1048,12 +1344,18 @@ function compressSteps(allSteps) {
   const lastInputIdx = new Map();
   allSteps.forEach((step, index) => {
     if (step.type !== "input") return;
-    const key = step.selector?.css || step.selector?.xpath;
+    const key =
+      step.selector?.css ||
+      step.selector?.xpath ||
+      step.selector?.relativeXPath;
     if (key) lastInputIdx.set(key, index);
   });
   const result = allSteps.filter((step, index) => {
     if (step.type !== "input") return true;
-    const key = step.selector?.css || step.selector?.xpath;
+    const key =
+      step.selector?.css ||
+      step.selector?.xpath ||
+      step.selector?.relativeXPath;
     if (!key) return true;
     return lastInputIdx.get(key) === index;
   });
@@ -1132,19 +1434,27 @@ function handleClick(event) {
   const target = resolveClickTarget(rawEl);
   if (!target) return;
 
+  currentPageName = detectBestPageName();
+
   const { css } = buildSelectors(target);
   const now = nowTs();
   if (lastClick.selector === css && now - lastClick.time < CLICK_DEBOUNCE_MS) {
     return;
   }
 
-  // Determine if radio or checkbox
   const isRadio =
     target.tagName === "INPUT" &&
     (target.getAttribute("type") || "").toLowerCase() === "radio";
   const isCheckbox =
     target.tagName === "INPUT" &&
     (target.getAttribute("type") || "").toLowerCase() === "checkbox";
+  const isButtonLike =
+    target.tagName === "BUTTON" ||
+    (target.tagName === "INPUT" &&
+      CLICKABLE_INPUT_TYPES.has(
+        (target.getAttribute("type") || "").toLowerCase(),
+      )) ||
+    target.getAttribute("role") === "button";
 
   let value = null;
   let stepType = "click";
@@ -1156,6 +1466,8 @@ function handleClick(event) {
     stepType = "check";
     const label = getCheckboxLabel(target);
     value = `${label}: ${target.checked ? "checked" : "unchecked"}`;
+  } else if (isButtonLike) {
+    value = null; // do not show in value column
   } else {
     value =
       target.getAttribute("aria-label") ||
@@ -1166,17 +1478,24 @@ function handleClick(event) {
 
   const step = createStep(stepType, target, value);
   if (step) {
-    // Add extra metadata for radio/checkbox
     if (isRadio || isCheckbox) {
       step.inputType = (target.getAttribute("type") || "").toLowerCase();
       step.checked = target.checked;
       step.fieldName = target.getAttribute("name") || null;
     }
 
+    if (isButtonLike) {
+      step.value = null;
+      step.buttonValue =
+        getButtonData(target)?.text ||
+        getButtonData(target)?.value ||
+        getDirectTextContent(target) ||
+        null;
+    }
+
     steps.push(step);
     lastClick = { selector: css, time: now };
 
-    // If this click might cause navigation, flush immediately
     const mightNavigate =
       target.tagName === "A" ||
       (target.tagName === "BUTTON" &&
@@ -1196,6 +1515,7 @@ function handleInput(event) {
   if (!(target instanceof Element)) return;
   if (!isRecording) return;
   if (isFromRecorderUi(target)) return;
+  if (shouldIgnoreAsInputTarget(target)) return;
 
   const tag = target.tagName;
   if (
@@ -1205,10 +1525,6 @@ function handleInput(event) {
     target.getAttribute("contenteditable") !== "true"
   ) {
     return;
-  }
-  if (tag === "INPUT") {
-    const type = (target.getAttribute("type") || "text").toLowerCase();
-    if (CLICKABLE_INPUT_TYPES.has(type)) return;
   }
 
   const { css } = buildSelectors(target);
@@ -1244,13 +1560,10 @@ function handleBlur(event) {
   if (!(target instanceof Element)) return;
   if (!isRecording) return;
   if (isFromRecorderUi(target)) return;
+  if (shouldIgnoreAsInputTarget(target)) return;
 
   const tag = target.tagName;
   if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") return;
-  if (tag === "INPUT") {
-    const type = (target.getAttribute("type") || "text").toLowerCase();
-    if (CLICKABLE_INPUT_TYPES.has(type)) return;
-  }
 
   const { css } = buildSelectors(target);
   const key = css || target;
@@ -1321,6 +1634,9 @@ export function startRecording() {
   lastClick = { selector: null, time: 0 };
   pendingInputs.clear();
 
+  currentPageName = detectBestPageName();
+  attachRouteObserver();
+
   if (!listenersAttached) {
     document.addEventListener("click", handleClick, true);
     document.addEventListener("input", handleInput, true);
@@ -1342,6 +1658,8 @@ export async function stopRecording() {
   }
 
   isRecording = false;
+  detachRouteObserver();
+  currentPageName = null;
 
   if (flushIntervalId) {
     clearInterval(flushIntervalId);
@@ -1364,10 +1682,20 @@ export async function stopRecording() {
 
 export function handleCreateVariable(kind) {
   if (!isRecording) return;
-  const k = kind === "output" ? "output" : "input";
+
+  const k =
+    kind === "output" ? "output" : kind === "button" ? "button" : "input";
+
   const variable = createVariable(k);
   if (variable) {
     variables.push(variable);
+
+    // Also log variable save as a step
+    const variableStep = buildVariableSavedStep(variable);
+    if (variableStep) {
+      steps.push(variableStep);
+    }
+
     console.log("[RECORDER] variable added:", variable.name);
   }
 }
