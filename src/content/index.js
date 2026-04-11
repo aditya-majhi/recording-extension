@@ -42,99 +42,6 @@ function checkAndResumeRecording() {
   });
 }
 
-// ── Dev Button ────────────────────────────────────────────────────────────────
-function updateDevButtonState() {
-  const btn = document.getElementById(DEV_BUTTON_ID);
-  if (!btn) return;
-  btn.textContent = devRecording ? "⏹ Stop" : "⏺ Record";
-  btn.style.background = devRecording ? "#c62828" : "#1565c0";
-}
-
-function createDevButton() {
-  if (document.getElementById(DEV_BUTTON_ID)) return;
-
-  const btn = document.createElement("button");
-  btn.id = DEV_BUTTON_ID;
-  btn.setAttribute(RECORDER_UI_ATTR, "true");
-  Object.assign(btn.style, {
-    position: "fixed",
-    bottom: "16px",
-    right: "16px",
-    zIndex: 2147483647,
-    padding: "8px 18px",
-    border: "none",
-    borderRadius: "8px",
-    color: "#fff",
-    fontWeight: "bold",
-    cursor: "pointer",
-    fontSize: "15px",
-    boxShadow: "0 2px 8px rgba(0,0,0,0.3)",
-  });
-
-  btn.addEventListener("click", async () => {
-    console.log("[INDEX] Dev button clicked — devRecording:", devRecording);
-
-    if (!devRecording) {
-      // ── START ──
-      console.log("[INDEX] === STARTING RECORDING ===");
-      devRecording = true;
-      updateDevButtonState();
-      startRecording();
-      console.log(
-        "[INDEX] startRecording() called, sending DEV_START_RECORDING to background",
-      );
-      chrome.runtime.sendMessage({ type: "DEV_START_RECORDING" }, (res) => {
-        if (chrome.runtime.lastError) {
-          console.error(
-            "[INDEX] DEV_START_RECORDING error:",
-            chrome.runtime.lastError.message,
-          );
-        } else {
-          console.log(
-            "[INDEX] DEV_START_RECORDING response:",
-            JSON.stringify(res),
-          );
-        }
-      });
-      showVideoPromptBar();
-    } else {
-      // ── STOP ──
-      console.log("[INDEX] === STOPPING RECORDING ===");
-      devRecording = false;
-      updateDevButtonState();
-      removeBar();
-
-      console.log("[INDEX] calling await stopRecording()...");
-      const result = await stopRecording();
-      console.log(
-        "[INDEX] stopRecording() resolved — steps:",
-        result.steps.length,
-        "vars:",
-        result.variables.length,
-      );
-
-      console.log("[INDEX] sending DEV_STOP_RECORDING to background...");
-      chrome.runtime.sendMessage({ type: "DEV_STOP_RECORDING" }, (res) => {
-        if (chrome.runtime.lastError) {
-          console.error(
-            "[INDEX] DEV_STOP_RECORDING error:",
-            chrome.runtime.lastError.message,
-          );
-          return;
-        }
-        console.log(
-          "[INDEX] DEV_STOP_RECORDING response:",
-          JSON.stringify(res),
-        );
-      });
-    }
-  });
-
-  document.documentElement.appendChild(btn);
-  updateDevButtonState();
-  console.log("[INDEX] Dev button created");
-}
-
 // ── Message Listener (background → content) ───────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   const type = msg?.type;
@@ -188,11 +95,9 @@ console.log("[INDEX] Content script loaded, readyState:", document.readyState);
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", () => {
     console.log("[INDEX] DOMContentLoaded fired");
-    createDevButton();
     checkAndResumeRecording();
   });
 } else {
   console.log("[INDEX] Document already ready");
-  createDevButton();
   checkAndResumeRecording();
 }

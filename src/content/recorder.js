@@ -766,12 +766,109 @@ function detectVariableContext(element) {
 }
 
 // ── Relative XPath generation ─────────────────────────────────────────────────
+function toXPathLiteral(value) {
+  const raw = String(value ?? "");
+  if (!raw.includes('"')) return `"${raw}"`;
+  if (!raw.includes("'")) return `'${raw}'`;
+
+  const parts = raw.split("'");
+  const chunks = [];
+  for (let i = 0; i < parts.length; i++) {
+    chunks.push(`"${parts[i].replace(/"/g, '\\"')}"`);
+    if (i < parts.length - 1) chunks.push(`"'"`);
+  }
+  return `concat(${chunks.join(", ")})`;
+}
+
+function normalizeSpaceText(text) {
+  return String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isStableId(value) {
+  return !!value && !/\d{5,}/.test(value);
+}
+
+function isStableClassName(className) {
+  if (!className || className.length < 3) return false;
+  if (/\d{3,}/.test(className)) return false;
+  if (
+    /^(active|selected|open|focus|focused|hover|show|visible)$/i.test(className)
+  ) {
+    return false;
+  }
+  if (
+    /(^|[-_])(active|selected|open|focus|hover|show|visible)([-_]|$)/i.test(
+      className,
+    )
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function buildOverlayScopedXPath(element) {
+  if (!(element instanceof Element)) return null;
+
+  const role = element.getAttribute("role");
+  const tag = element.tagName.toLowerCase();
+
+  const optionLike =
+    role === "option" ||
+    role === "menuitem" ||
+    role === "tab" ||
+    tag === "li" ||
+    element.classList.contains("dropdown-item") ||
+    element.classList.contains("menu-item") ||
+    element.classList.contains("MuiMenuItem-root") ||
+    element.classList.contains("ant-select-item-option");
+
+  if (!optionLike) return null;
+
+  const text = normalizeSpaceText(
+    getDirectTextContent(element) || element.textContent || "",
+  );
+  if (!text) return null;
+
+  const itemRolePart = role ? ` and @role=${toXPathLiteral(role)}` : "";
+  const itemExpr = `//${tag}[normalize-space(.)=${toXPathLiteral(text)}${itemRolePart}]`;
+
+  const container = element.closest(
+    '[role="listbox"], [role="menu"], .dropdown-menu, .MuiMenu-list, .ant-select-dropdown, .ant-dropdown-menu, .popover',
+  );
+
+  if (!container) return itemExpr;
+
+  if (isStableId(container.id)) {
+    return `//*[@id=${toXPathLiteral(container.id)}]${itemExpr}`;
+  }
+
+  const containerRole = container.getAttribute("role");
+  if (containerRole === "listbox" || containerRole === "menu") {
+    return `//*[@role=${toXPathLiteral(containerRole)}]${itemExpr}`;
+  }
+
+  return itemExpr;
+}
+
 function getRelativeXPath(element) {
   if (!(element instanceof Element)) return null;
 
-  if (element.id && !/\d{5,}/.test(element.id)) {
-    return `//*[@id="${element.id}"]`;
+  const dataTestId =
+    element.getAttribute("data-testid") ||
+    element.getAttribute("data-test") ||
+    element.getAttribute("data-qa");
+  if (dataTestId) {
+    return `//*[@data-testid=${toXPathLiteral(dataTestId)} or @data-test=${toXPathLiteral(dataTestId)} or @data-qa=${toXPathLiteral(dataTestId)}]`;
   }
+
+  if (isStableId(element.id)) {
+    return `//*[@id=${toXPathLiteral(element.id)}]`;
+  }
+
+  const overlayScoped = buildOverlayScopedXPath(element);
+  if (overlayScoped) return overlayScoped;
 
   if (
     element.tagName === "INPUT" ||
@@ -783,99 +880,100 @@ function getRelativeXPath(element) {
     if (type === "radio") {
       const name = element.getAttribute("name");
       const value = element.getAttribute("value");
+
       if (name && value) {
-        return `//input[@name="${name}" and @value="${value}"]`;
+        return `//input[@name=${toXPathLiteral(name)} and @value=${toXPathLiteral(value)}]`;
       }
+
       if (name) {
         const label = findLabelText(element);
         if (label) {
-          const safeLabel = label.replace(/'/g, "\\'");
-          return `//label[contains(normalize-space(.),'${safeLabel}')]/input[@type='radio']`;
+          return `//label[contains(normalize-space(.), ${toXPathLiteral(normalizeSpaceText(label))})]/input[@type="radio"]`;
         }
-        return `//input[@name="${name}" and @type="radio"]`;
+        return `//input[@name=${toXPathLiteral(name)} and @type="radio"]`;
       }
     }
 
     if (type === "checkbox") {
       const name = element.getAttribute("name");
       const value = element.getAttribute("value");
+
       if (name && value) {
-        return `//input[@name="${name}" and @value="${value}"]`;
+        return `//input[@name=${toXPathLiteral(name)} and @value=${toXPathLiteral(value)}]`;
       }
+
       const label = findLabelText(element);
       if (label) {
-        const safeLabel = label.replace(/'/g, "\\'");
-        return `//label[contains(normalize-space(.),'${safeLabel}')]/input[@type='checkbox']`;
+        return `//label[contains(normalize-space(.), ${toXPathLiteral(normalizeSpaceText(label))})]/input[@type="checkbox"]`;
       }
+
       if (name) {
-        return `//input[@name="${name}" and @type="checkbox"]`;
+        return `//input[@name=${toXPathLiteral(name)} and @type="checkbox"]`;
       }
     }
 
     const labelText = findLabelText(element);
     if (labelText) {
-      const safeLabel = labelText.replace(/'/g, "\\'");
       const tag = element.tagName.toLowerCase();
 
-      if (element.id) {
-        return `//${tag}[@id="${element.id}"]`;
+      if (isStableId(element.id)) {
+        return `//${tag}[@id=${toXPathLiteral(element.id)}]`;
       }
 
       const name = element.getAttribute("name");
       if (name) {
-        return `//${tag}[@name="${name}"]`;
+        return `//${tag}[@name=${toXPathLiteral(name)}]`;
       }
 
       const placeholder = element.getAttribute("placeholder");
       if (placeholder) {
-        return `//${tag}[@placeholder="${placeholder}"]`;
+        return `//${tag}[@placeholder=${toXPathLiteral(placeholder)}]`;
       }
 
-      return `//label[contains(normalize-space(.),'${safeLabel}')]/following::${tag}[1]`;
+      return `//label[contains(normalize-space(.), ${toXPathLiteral(normalizeSpaceText(labelText))})]/following::${tag}[1]`;
     }
 
     const name = element.getAttribute("name");
     if (name && !/\d{5,}/.test(name)) {
-      return `//${element.tagName.toLowerCase()}[@name="${name}"]`;
+      return `//${element.tagName.toLowerCase()}[@name=${toXPathLiteral(name)}]`;
     }
 
     const placeholder = element.getAttribute("placeholder");
     if (placeholder) {
-      return `//${element.tagName.toLowerCase()}[@placeholder="${placeholder}"]`;
+      return `//${element.tagName.toLowerCase()}[@placeholder=${toXPathLiteral(placeholder)}]`;
     }
   }
 
   if (element.tagName === "BUTTON" || element.tagName === "A") {
-    const text = getDirectTextContent(element)?.trim();
-    if (text && text.length < 50) {
-      const safeText = text.replace(/'/g, "\\'");
+    const text = normalizeSpaceText(getDirectTextContent(element));
+    if (text && text.length < 80) {
       const tag = element.tagName.toLowerCase();
-      return `//${tag}[normalize-space(.)='${safeText}']`;
+      return `//${tag}[normalize-space(.)=${toXPathLiteral(text)}]`;
     }
   }
 
   const role = element.getAttribute("role");
   if (role) {
-    const text = (element.textContent || "").trim().slice(0, 50);
+    const text = normalizeSpaceText((element.textContent || "").slice(0, 120));
     if (text) {
-      const safeText = text.replace(/'/g, "\\'");
-      return `//*[@role="${role}" and contains(normalize-space(.),'${safeText}')]`;
+      return `//*[@role=${toXPathLiteral(role)} and normalize-space(.)=${toXPathLiteral(text)}]`;
     }
-    return `//*[@role="${role}"]`;
+    return `//*[@role=${toXPathLiteral(role)}]`;
   }
 
   const ariaLabel = element.getAttribute("aria-label");
   if (ariaLabel) {
-    return `//*[@aria-label="${ariaLabel}"]`;
+    return `//*[@aria-label=${toXPathLiteral(ariaLabel)}]`;
   }
 
   if (element.classList.length) {
-    const mainClass = Array.from(element.classList).find(
-      (c) => !/\d{3,}/.test(c) && c.length > 2,
+    const mainClass = Array.from(element.classList).find((className) =>
+      isStableClassName(className),
     );
     if (mainClass) {
       const tag = element.tagName.toLowerCase();
-      return `//${tag}[contains(@class,'${mainClass}')]`;
+      const classToken = ` ${mainClass} `;
+      return `//${tag}[contains(concat(" ", normalize-space(@class), " "), ${toXPathLiteral(classToken)})]`;
     }
   }
 
@@ -890,19 +988,24 @@ function getRelativeXPath(element) {
       const rowIdx = rows.indexOf(tr) + 1;
       const cells = Array.from(tr.children);
       const colIdx = cells.indexOf(td) + 1;
-      const tableXPath = table.id ? `//table[@id="${table.id}"]` : "//table";
+      const tableXPath = isStableId(table.id)
+        ? `//table[@id=${toXPathLiteral(table.id)}]`
+        : "//table";
       return `${tableXPath}//tr[${rowIdx}]/td[${colIdx}]`;
     }
   }
 
   const tag = element.tagName.toLowerCase();
-  const text = getDirectTextContent(element)?.trim();
+  const text = normalizeSpaceText(getDirectTextContent(element));
   if (text) {
-    const safe = text.replace(/'/g, "\\'");
-    return `//${tag}[normalize-space(.)='${safe}']`;
+    return `//${tag}[normalize-space(.)=${toXPathLiteral(text)}]`;
   }
+
   const name = element.getAttribute("name");
-  if (name) return `//${tag}[@name="${name}"]`;
+  if (name) {
+    return `//${tag}[@name=${toXPathLiteral(name)}]`;
+  }
+
   return `//${tag}`;
 }
 
@@ -1274,6 +1377,12 @@ function createVariable(kind) {
     value: captureValue != null ? captureValue : null,
   };
 
+  // For page name
+  const detectedPageName = getPageName() || "Unknown Page";
+  const userPage = window.prompt("Page name", detectedPageName);
+  if (userPage === null) return null;
+  const finalPageName = userPage.trim() || detectedPageName;
+
   let enumValues = null;
   if (el.tagName === "SELECT") {
     enumValues = Array.from(el.options).map((opt) => ({
@@ -1314,7 +1423,7 @@ function createVariable(kind) {
     inputType: el.getAttribute("type") || null,
     pageUrl: window.location.href,
     pageTitle: document.title || null,
-    pageName,
+    pageName: finalPageName,
     createdAt: new Date().toISOString(),
   };
 
