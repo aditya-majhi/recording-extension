@@ -15,13 +15,7 @@ const INPUT_DEBOUNCE_MS = 800;
 const FLUSH_INTERVAL_MS = 2000;
 const RECORDER_UI_ATTR = "data-automation-recorder-ui";
 
-const CLICKABLE_INPUT_TYPES = new Set([
-  "submit",
-  "button",
-  "reset",
-  "checkbox",
-  "radio",
-]);
+const CLICKABLE_INPUT_TYPES = new Set(["submit", "button", "reset"]);
 
 // ── Utils ─────────────────────────────────────────────────────────────────────
 
@@ -1020,7 +1014,8 @@ function getElementValue(el) {
   if (!el) return null;
   if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
     const type = (el.getAttribute("type") || "text").toLowerCase();
-    if (type === "checkbox" || type === "radio") return el.checked;
+    if (type === "radio") return el.value || el.getAttribute("value") || null;
+    if (type === "checkbox") return el.checked;
     return el.value;
   }
   if (el.tagName === "SELECT") return el.value;
@@ -1227,8 +1222,8 @@ function findLabelText(element) {
 }
 
 function generateVariableName(element, kind) {
-  const buttonData = getButtonData(element);
-  if (kind === "button" || buttonData) {
+  if (kind === "button") {
+    const buttonData = getButtonData(element);
     const raw =
       buttonData?.text ||
       element.getAttribute("aria-label") ||
@@ -1245,6 +1240,7 @@ function generateVariableName(element, kind) {
 
   const label = findLabelText(element);
   const prefix = kind === "output" ? "out" : "in";
+
   if (label) {
     const cleaned = label
       .replace(/[^a-zA-Z0-9\s]/g, "")
@@ -1261,8 +1257,9 @@ function generateVariableName(element, kind) {
       return `${prefix}_${camel}`.slice(0, 50);
     }
   }
+
   const tag = element.tagName.toLowerCase();
-  const type = element.getAttribute("type") || "";
+  const type = (element.getAttribute("type") || "").toLowerCase();
   const fallback = type ? `${tag}_${type}` : tag;
   return `${prefix}_${fallback}`.slice(0, 50);
 }
@@ -1335,26 +1332,79 @@ function buildVariableSavedStep(variable) {
   };
 }
 
+//Helper function for create variables
+function normalizeVariableTarget(rawEl) {
+  if (!(rawEl instanceof Element)) return null;
+
+  // Direct form controls
+  if (
+    rawEl.tagName === "INPUT" ||
+    rawEl.tagName === "TEXTAREA" ||
+    rawEl.tagName === "SELECT"
+  ) {
+    return rawEl;
+  }
+
+  // Wrapped by label
+  const label = rawEl.closest("label");
+  if (label) {
+    const forAttr = label.getAttribute("for");
+    if (forAttr) {
+      const linked = document.getElementById(forAttr);
+      if (
+        linked &&
+        (linked.tagName === "INPUT" ||
+          linked.tagName === "TEXTAREA" ||
+          linked.tagName === "SELECT")
+      ) {
+        return linked;
+      }
+    }
+
+    const wrapped = label.querySelector("input, textarea, select");
+    if (wrapped) return wrapped;
+  }
+
+  // Custom radio wrappers: prefer actual radio input if present
+  const embeddedRadio = rawEl.querySelector('input[type="radio"]');
+  if (embeddedRadio) return embeddedRadio;
+
+  const embeddedCheckbox = rawEl.querySelector('input[type="checkbox"]');
+  if (embeddedCheckbox) return embeddedCheckbox;
+
+  // Fallback
+  return rawEl;
+}
+
 function createVariable(kind) {
-  const el =
+  const rawEl =
     lastRightClickedElement ||
     (document.activeElement instanceof Element ? document.activeElement : null);
-  if (!el) return null;
+
+  const normalizedTarget = normalizeVariableTarget(rawEl);
+  if (!normalizedTarget) return null;
+
+  const el = normalizedTarget;
+  const normalizedKind =
+    kind === "output" ? "output" : kind === "button" ? "button" : "input";
 
   const { css, xpath, relativeXPath } = buildSelectors(el);
   if (!css && !xpath && !relativeXPath) return null;
 
-  const buttonData = getButtonData(el);
-  const isButtonVariable = kind === "button" || buttonData !== null;
+  const inputType = (el.getAttribute("type") || "").toLowerCase();
+  const isRadioOrCheckbox =
+    el.tagName === "INPUT" &&
+    (inputType === "radio" || inputType === "checkbox");
+
+  // Important: only treat as button metadata when user explicitly chose button
+  const buttonData = normalizedKind === "button" ? getButtonData(el) : null;
+  const isButtonVariable = normalizedKind === "button";
 
   const baseValue = getElementValue(el);
   const dataType = detectDataType(el);
-  const context = isButtonVariable
-    ? { type: "button" }
-    : detectVariableContext(el);
-  const pageName = getPageName();
+  const context = detectVariableContext(el);
 
-  const suggestedName = generateVariableName(el, kind);
+  const suggestedName = generateVariableName(el, normalizedKind);
   const clickedSvg =
     el.tagName.toLowerCase() === "svg" || !!el.querySelector("svg");
   const defaultPromptValue = clickedSvg ? "" : suggestedName;
@@ -1377,27 +1427,25 @@ function createVariable(kind) {
     value: captureValue != null ? captureValue : null,
   };
 
-  // For page name
   const detectedPageName = getPageName() || "Unknown Page";
   const userPage = window.prompt("Page name", detectedPageName);
   if (userPage === null) return null;
   const finalPageName = userPage.trim() || detectedPageName;
 
   let enumValues = null;
+
   if (el.tagName === "SELECT") {
     enumValues = Array.from(el.options).map((opt) => ({
       value: opt.value,
       label: opt.textContent?.trim() || opt.value,
     }));
   }
-  if (
-    el.tagName === "INPUT" &&
-    (el.getAttribute("type") || "").toLowerCase() === "radio"
-  ) {
+
+  if (el.tagName === "INPUT" && inputType === "radio") {
     const radioName = el.getAttribute("name");
     if (radioName) {
       const radios = document.querySelectorAll(
-        `input[type="radio"][name="${CSS.escape(radioName)}"]`,
+        [`input[type="radio"][name="${CSS.escape(radioName)}"]`].join(", "),
       );
       enumValues = Array.from(radios).map((r) => {
         const optLabel = getRadioSelectedLabel(r);
@@ -1411,7 +1459,7 @@ function createVariable(kind) {
 
   const variable = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    kind,
+    kind: normalizedKind,
     name: finalName,
     selector: { css, xpath, relativeXPath },
     value: baseValue,
@@ -1427,22 +1475,34 @@ function createVariable(kind) {
     createdAt: new Date().toISOString(),
   };
 
-  if (isButtonVariable) {
-    variable.kind = "button";
-    variable.context = { type: "button" };
-    variable.isButton = true;
+  // For input/output radios/checkboxes, force non-button semantics
+  if (!isButtonVariable && isRadioOrCheckbox) {
+    variable.dataType = inputType === "radio" ? "enum" : "boolean";
+  }
+
+  if (isButtonVariable && buttonData) {
+    variable.isButtonElement = true;
     variable.buttonData = buttonData;
     variable.dataType = "button";
-    variable.value =
-      buttonData?.text ||
-      buttonData?.value ||
-      getDirectTextContent(el) ||
-      getElementValue(el) ||
-      null;
-    variable.capture = {
-      text: variable.value != null ? String(variable.value) : null,
-      value: variable.value,
-    };
+
+    if (variable.value == null || variable.value === "") {
+      variable.value =
+        buttonData.text ||
+        buttonData.value ||
+        getDirectTextContent(el) ||
+        getElementValue(el) ||
+        null;
+    }
+
+    if (
+      !variable.capture ||
+      (!variable.capture.text && variable.capture.value == null)
+    ) {
+      variable.capture = {
+        text: variable.value != null ? String(variable.value) : null,
+        value: variable.value,
+      };
+    }
   }
 
   return variable;
@@ -1634,6 +1694,12 @@ function handleInput(event) {
     target.getAttribute("contenteditable") !== "true"
   ) {
     return;
+  }
+
+  // Radio inputs are already captured as "select" steps by handleClick — skip here
+  if (tag === "INPUT") {
+    const inputType = (target.getAttribute("type") || "").toLowerCase();
+    if (inputType === "radio") return;
   }
 
   const { css } = buildSelectors(target);
