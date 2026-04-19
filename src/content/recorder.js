@@ -1402,7 +1402,8 @@ function createVariable(kind) {
 
   const baseValue = getElementValue(el);
   const dataType = detectDataType(el);
-  const context = detectVariableContext(el);
+  const detectedContext = detectVariableContext(el);
+  const context = kind === "button" ? { type: "button" } : detectedContext;
 
   const suggestedName = generateVariableName(el, normalizedKind);
   const clickedSvg =
