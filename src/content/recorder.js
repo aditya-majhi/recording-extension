@@ -9,6 +9,8 @@ let currentPageName = null;
 let routeObserverCleanup = null;
 
 const pendingInputs = new Map();
+const dropdownValueByControlKey = new Map();
+let lastOpenedDropdownKey = "";
 
 const CLICK_DEBOUNCE_MS = 300;
 const INPUT_DEBOUNCE_MS = 800;
@@ -18,6 +20,18 @@ const RECORDER_UI_ATTR = "data-automation-recorder-ui";
 const CLICKABLE_INPUT_TYPES = new Set(["submit", "button", "reset"]);
 
 // ── Utils ─────────────────────────────────────────────────────────────────────
+
+//Debugging helper
+const DEBUG_DROPDOWN_CAPTURE = true;
+
+function dbg(label, payload = {}) {
+  if (!DEBUG_DROPDOWN_CAPTURE) return;
+  try {
+    console.log("[RECORDER][DROPDOWN]", label, payload);
+  } catch {
+    // no-op
+  }
+}
 
 // ── Navigation flush: save steps before page unloads ──
 function handleBeforeUnload() {
@@ -1012,14 +1026,164 @@ function buildSelectors(element) {
 
 function getElementValue(el) {
   if (!el) return null;
+
   if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
     const type = (el.getAttribute("type") || "text").toLowerCase();
     if (type === "radio") return el.value || el.getAttribute("value") || null;
     if (type === "checkbox") return el.checked;
     return el.value;
   }
-  if (el.tagName === "SELECT") return el.value;
+
+  if (el.tagName === "SELECT") {
+    const selectedOption =
+      el.selectedOptions && el.selectedOptions.length > 0
+        ? el.selectedOptions[0]
+        : el.options && el.selectedIndex >= 0
+          ? el.options[el.selectedIndex]
+          : null;
+
+    const rawValue = el.value;
+    if (rawValue != null && String(rawValue).trim() !== "") return rawValue;
+
+    const text =
+      selectedOption && selectedOption.textContent
+        ? selectedOption.textContent.trim()
+        : "";
+
+    dbg("getElementValue:select", {
+      tag: el.tagName,
+      rawValue,
+      selectedIndex: el.selectedIndex,
+      selectedText:
+        selectedOption && selectedOption.textContent
+          ? selectedOption.textContent.trim()
+          : "",
+    });
+
+    return text || null;
+  }
+
+  const role = (el.getAttribute("role") || "").toLowerCase();
+
+  if (role === "combobox" || el.matches("[aria-haspopup='listbox']")) {
+    const ariaValueText = (el.getAttribute("aria-valuetext") || "").trim();
+    if (ariaValueText) return ariaValueText;
+
+    const hiddenInput = el.querySelector(
+      "input[type='hidden'], input[type='text']",
+    );
+    if (hiddenInput && hiddenInput.value && hiddenInput.value.trim()) {
+      return hiddenInput.value.trim();
+    }
+
+    const selectedLike =
+      el.querySelector(
+        "[aria-selected='true'], .ant-select-selection-item, .react-select__single-value, .ng-value-label, .MuiSelect-select",
+      ) || null;
+
+    const selectedText = selectedLike?.textContent?.trim();
+
+    dbg("getElementValue:combobox", {
+      role,
+      ariaValueText: (el.getAttribute("aria-valuetext") || "").trim(),
+      selectedText,
+      className: el.className || "",
+    });
+
+    if (selectedText) return selectedText;
+  }
+
+  if (role === "listbox") {
+    const selectedOption =
+      el.querySelector("[role='option'][aria-selected='true']") || null;
+    const selectedText = selectedOption?.textContent?.trim();
+    if (selectedText) return selectedText;
+  }
+
+  if (role === "option") {
+    const txt = el.textContent?.trim();
+    if (txt) return txt;
+  }
+
   return el.textContent?.trim() ?? null;
+}
+
+//selector helpers
+function getSelectorKeyFromElement(el) {
+  if (!(el instanceof Element)) return "";
+  const s = buildSelectors(el);
+  return s.css || s.relativeXPath || s.xpath || "";
+}
+
+function getOptionText(el) {
+  if (!(el instanceof Element)) return "";
+  return (el.textContent || "").trim();
+}
+
+function isOptionLike(el) {
+  if (!(el instanceof Element)) return false;
+  const role = (el.getAttribute("role") || "").toLowerCase();
+  return (
+    role === "option" ||
+    role === "menuitem" ||
+    el.matches(
+      "option, .ant-select-item-option, .react-select__option, .MuiMenuItem-root, .mat-option",
+    )
+  );
+}
+
+function findOwningDropdownControlFromOption(optionEl) {
+  if (!(optionEl instanceof Element)) return null;
+
+  const listbox = optionEl.closest("[role='listbox'], [role='menu']");
+  if (listbox && listbox.id) {
+    const byAriaControls = document.querySelector(
+      "[role='combobox'][aria-controls='" + CSS.escape(listbox.id) + "']",
+    );
+    if (byAriaControls instanceof Element) return byAriaControls;
+  }
+
+  const openCombobox = document.querySelector(
+    "[role='combobox'][aria-expanded='true'], .ant-select-open [role='combobox'], .react-select__control--menu-is-open, .MuiSelect-select[aria-expanded='true']",
+  );
+  if (openCombobox instanceof Element) return openCombobox;
+
+  return null;
+}
+
+function isDropdownControl(el) {
+  if (!(el instanceof Element)) return false;
+  return (
+    el.tagName === "SELECT" ||
+    el.matches(
+      "[role='combobox'], [aria-haspopup='listbox'], .ant-select-selector, .react-select__control, .MuiSelect-select, .ng-select-container",
+    )
+  );
+}
+
+function getDropdownCacheKeyFromElement(el) {
+  if (!(el instanceof Element)) return "";
+
+  // Canonical key for react-select style input IDs
+  if (el.id && /^react-select-\d+-input$/i.test(el.id)) {
+    const pageKey = (window.location.pathname || "").trim() || "/";
+    return pageKey + "::#" + el.id;
+  }
+
+  // If wrapper/container is passed, resolve inner combobox input first
+  const comboboxInput = el.matches("input[role='combobox']")
+    ? el
+    : el.querySelector("input[role='combobox']");
+
+  if (comboboxInput && comboboxInput.id) {
+    const pageKey = (window.location.pathname || "").trim() || "/";
+    return pageKey + "::#" + comboboxInput.id;
+  }
+
+  const selectorKey = getSelectorKeyFromElement(el);
+  if (!selectorKey) return "";
+  const pageKey = (window.location.pathname || "").trim() || "/";
+  return pageKey + "::" + selectorKey;
 }
 
 // ── Radio / Checkbox value helpers ────────────────────────────────────────────
@@ -1316,7 +1480,7 @@ function buildVariableSavedStep(variable) {
   return {
     type: "store_variable",
     selector: variable.selector || null,
-    value: null,
+    value: variable.value ?? null,
     variableName: variable.name,
     variableKind: variable.kind,
     variableValue: variable.value ?? null,
@@ -1326,9 +1490,11 @@ function buildVariableSavedStep(variable) {
     pageTitle: variable.pageTitle || document.title || null,
     pageName: variable.pageName || getPageName(),
     context:
-      typeof variable.context === "object"
-        ? variable.context
-        : { type: variable.context || "formField" },
+      variable.kind === "button"
+        ? { type: "button" }
+        : typeof variable.context === "object"
+          ? variable.context
+          : { type: variable.context || "formField" },
   };
 }
 
@@ -1336,13 +1502,55 @@ function buildVariableSavedStep(variable) {
 function normalizeVariableTarget(rawEl) {
   if (!(rawEl instanceof Element)) return null;
 
-  // Direct form controls
+  // Table-first resolution: avoid capturing entire table text
+  const tableCell = rawEl.closest("td, th");
+  if (tableCell) return tableCell;
+
+  const tableRow = rawEl.closest("tr");
+  if (tableRow) return tableRow;
+
+  if (rawEl.tagName === "TABLE") {
+    const firstRow = rawEl.querySelector("tbody tr, tr");
+    if (firstRow) return firstRow;
+  }
+
+  // Direct native controls
   if (
     rawEl.tagName === "INPUT" ||
     rawEl.tagName === "TEXTAREA" ||
     rawEl.tagName === "SELECT"
   ) {
     return rawEl;
+  }
+
+  // Click on option text/item -> resolve to owning control
+  const optionLike = rawEl.closest(
+    "option, [role='option'], .ant-select-item-option, .MuiMenuItem-root, .mat-option, .react-select__option",
+  );
+  if (optionLike) {
+    const nativeSelect = optionLike.closest("select");
+    if (nativeSelect) return nativeSelect;
+
+    const ownerCombobox = document.querySelector(
+      "[role='combobox'][aria-expanded='true'], .ant-select-open [role='combobox'], .react-select__control--menu-is-open, .MuiSelect-select[aria-expanded='true']",
+    );
+    if (ownerCombobox instanceof Element) return ownerCombobox;
+
+    const nearbyCombobox = optionLike.closest(
+      "[role='combobox'], [aria-haspopup='listbox'], .ant-select, .react-select__control, .MuiSelect-select, .ng-select-container",
+    );
+    if (nearbyCombobox) return nearbyCombobox;
+  }
+
+  // Click on selected value text/chip inside custom dropdown
+  const selectedValueLike = rawEl.closest(
+    ".ant-select-selection-item, .react-select__single-value, .MuiSelect-select, .ng-value-label, [aria-live='polite']",
+  );
+  if (selectedValueLike) {
+    const container = selectedValueLike.closest(
+      "[role='combobox'], [aria-haspopup='listbox'], .ant-select, .react-select__control, .MuiSelect-select, .ng-select-container",
+    );
+    if (container) return container;
   }
 
   // Wrapped by label
@@ -1365,26 +1573,68 @@ function normalizeVariableTarget(rawEl) {
     if (wrapped) return wrapped;
   }
 
-  // Custom radio wrappers: prefer actual radio input if present
+  // Generic dropdown control wrappers
+  const dropdownControl = rawEl.closest(
+    "select, [role='combobox'], [aria-haspopup='listbox'], .ant-select-selector, .react-select__control, .MuiSelect-select, .ng-select-container",
+  );
+  if (dropdownControl) return dropdownControl;
+
+  // Custom radio/checkbox wrappers
   const embeddedRadio = rawEl.querySelector('input[type="radio"]');
   if (embeddedRadio) return embeddedRadio;
 
   const embeddedCheckbox = rawEl.querySelector('input[type="checkbox"]');
   if (embeddedCheckbox) return embeddedCheckbox;
 
-  // Fallback
   return rawEl;
 }
 
 function createVariable(kind) {
-  const rawEl =
-    lastRightClickedElement ||
-    (document.activeElement instanceof Element ? document.activeElement : null);
+  const activeEl =
+    document.activeElement instanceof Element ? document.activeElement : null;
 
-  const normalizedTarget = normalizeVariableTarget(rawEl);
-  if (!normalizedTarget) return null;
+  const candidateRoots = [
+    lastRightClickedElement,
+    document.querySelector("[role='combobox'][aria-expanded='true']"),
+    document.querySelector(".ant-select-focused [role='combobox']"),
+    document.querySelector(
+      ".react-select__control--is-focused input[role='combobox']",
+    ),
+    document.querySelector(".Mui-focused [role='combobox']"),
+    activeEl,
+  ].filter(Boolean);
 
-  const el = normalizedTarget;
+  dbg("createVariable:candidates", {
+    kind,
+    candidateCount: candidateRoots.length,
+    candidates: candidateRoots.map((c) => ({
+      tag: c?.tagName || null,
+      role: c?.getAttribute?.("role") || null,
+      className: c?.className || null,
+      text: (c?.textContent || "").trim().slice(0, 80),
+    })),
+    lastOpenedDropdownKey,
+    lastRightClickedElement: lastRightClickedElement,
+  });
+
+  let el = null;
+  for (const c of candidateRoots) {
+    const resolved = normalizeVariableTarget(c);
+    if (resolved instanceof Element) {
+      el = resolved;
+      break;
+    }
+  }
+
+  dbg("createVariable:resolvedElement", {
+    tag: el?.tagName || null,
+    role: el?.getAttribute?.("role") || null,
+    className: el?.className || null,
+    selectorKey: getSelectorKeyFromElement(el),
+    dropdownCacheKey: getDropdownCacheKeyFromElement(el),
+  });
+
+  if (!el) return null;
   const normalizedKind =
     kind === "output" ? "output" : kind === "button" ? "button" : "input";
 
@@ -1401,6 +1651,49 @@ function createVariable(kind) {
   const isButtonVariable = normalizedKind === "button";
 
   const baseValue = getElementValue(el);
+  const clickedText = (el?.textContent || "").trim();
+  let finalValue =
+    baseValue != null && String(baseValue).trim() !== ""
+      ? baseValue
+      : clickedText || null;
+
+  const controlKey = getDropdownCacheKeyFromElement(el);
+
+  let effectiveKey = controlKey || lastOpenedDropdownKey;
+
+  // If resolved key is present but has no cached value, fallback to last opened key.
+  if (
+    effectiveKey &&
+    !dropdownValueByControlKey.has(effectiveKey) &&
+    lastOpenedDropdownKey &&
+    dropdownValueByControlKey.has(lastOpenedDropdownKey)
+  ) {
+    effectiveKey = lastOpenedDropdownKey;
+  }
+
+  if (
+    (finalValue == null || String(finalValue).trim() === "") &&
+    effectiveKey &&
+    dropdownValueByControlKey.has(effectiveKey)
+  ) {
+    finalValue = dropdownValueByControlKey.get(effectiveKey);
+  }
+
+  dbg("createVariable:valueResolution", {
+    baseValue,
+    clickedText,
+    finalValueBeforeCache: finalValue,
+    controlKey,
+    effectiveKey,
+    cachedValue: effectiveKey
+      ? dropdownValueByControlKey.get(effectiveKey)
+      : null,
+    hasCached: effectiveKey
+      ? dropdownValueByControlKey.has(effectiveKey)
+      : false,
+    finalValueAfterCache: finalValue,
+  });
+
   const dataType = detectDataType(el);
   const detectedContext = detectVariableContext(el);
   const context = kind === "button" ? { type: "button" } : detectedContext;
@@ -1422,7 +1715,7 @@ function createVariable(kind) {
       .slice(0, 80) || "var_button";
 
   const captureText = (el.textContent || "").trim().slice(0, 200);
-  const captureValue = getElementValue(el);
+  const captureValue = finalValue;
   const capture = {
     text: captureText || null,
     value: captureValue != null ? captureValue : null,
@@ -1463,7 +1756,7 @@ function createVariable(kind) {
     kind: normalizedKind,
     name: finalName,
     selector: { css, xpath, relativeXPath },
-    value: baseValue,
+    value: finalValue,
     dataType,
     context,
     enumValues,
@@ -1476,12 +1769,25 @@ function createVariable(kind) {
     createdAt: new Date().toISOString(),
   };
 
+  if (
+    el.tagName === "SELECT" &&
+    (baseValue == null || String(baseValue).trim() === "") &&
+    enumValues &&
+    Array.isArray(enumValues)
+  ) {
+    const idx = el.selectedIndex;
+    if (idx >= 0 && enumValues[idx]) {
+      finalValue = enumValues[idx].value || enumValues[idx].label || null;
+    }
+  }
+
   // For input/output radios/checkboxes, force non-button semantics
   if (!isButtonVariable && isRadioOrCheckbox) {
     variable.dataType = inputType === "radio" ? "enum" : "boolean";
   }
 
   if (isButtonVariable && buttonData) {
+    variable.context = { type: "button" };
     variable.isButtonElement = true;
     variable.buttonData = buttonData;
     variable.dataType = "button";
@@ -1505,6 +1811,23 @@ function createVariable(kind) {
       };
     }
   }
+
+  if (effectiveKey) {
+    dropdownValueByControlKey.delete(effectiveKey);
+  }
+  lastOpenedDropdownKey = "";
+
+  dbg("createVariable:finalVariable", {
+    name: variable.name,
+    value: variable.value,
+    dataType: variable.dataType,
+    tag: variable.targetTag,
+    pageName: variable.pageName,
+    effectiveKey,
+    cacheValueAtEnd: effectiveKey
+      ? dropdownValueByControlKey.get(effectiveKey)
+      : null,
+  });
 
   return variable;
 }
@@ -1601,7 +1924,47 @@ function handleClick(event) {
   if (!rawEl) return;
   if (isFromRecorderUi(rawEl)) return;
 
+  dbg("handleClick:start", {
+    rawTag: rawEl?.tagName,
+    rawRole: rawEl?.getAttribute?.("role") || null,
+    rawClass: rawEl?.className || null,
+    rawText: (rawEl?.textContent || "").trim().slice(0, 120),
+  });
+
+  const openedDropdown = rawEl.closest(
+    "select, [role='combobox'], [aria-haspopup='listbox'], .ant-select-selector, .react-select__control, .MuiSelect-select, .ng-select-container",
+  );
+
+  if (openedDropdown) {
+    const openKey = getDropdownCacheKeyFromElement(openedDropdown);
+    if (openKey) {
+      // Clear stale value for this control whenever user opens/clicks it again.
+      dropdownValueByControlKey.delete(openKey);
+      lastOpenedDropdownKey = openKey;
+    }
+  }
+
+  dbg("handleClick:openedDropdown", {
+    found: !!openedDropdown,
+    openedTag: openedDropdown?.tagName || null,
+    openedRole: openedDropdown?.getAttribute?.("role") || null,
+    openedKey: openedDropdown
+      ? getDropdownCacheKeyFromElement(openedDropdown)
+      : "",
+    lastOpenedDropdownKey,
+  });
+
   const target = resolveClickTarget(rawEl);
+
+  dbg("handleClick:resolvedTarget", {
+    targetTag: target?.tagName || null,
+    targetRole: target?.getAttribute?.("role") || null,
+    targetClass: target?.className || null,
+    isOptionLike: target ? isOptionLike(target) : false,
+    selectorKey: target ? getSelectorKeyFromElement(target) : "",
+    targetText: (target?.textContent || "").trim().slice(0, 120),
+  });
+
   if (!target) return;
 
   currentPageName = detectBestPageName();
@@ -1611,6 +1974,49 @@ function handleClick(event) {
   if (lastClick.selector === css && now - lastClick.time < CLICK_DEBOUNCE_MS) {
     return;
   }
+
+  let owner = null;
+  let selectedText = "";
+  let optionKey = "";
+
+  if (isOptionLike(target)) {
+    owner = findOwningDropdownControlFromOption(target);
+    selectedText = getOptionText(target);
+
+    if (owner) {
+      optionKey = getDropdownCacheKeyFromElement(owner);
+    }
+    if (!optionKey) {
+      optionKey = lastOpenedDropdownKey;
+    }
+
+    if (optionKey && selectedText) {
+      dropdownValueByControlKey.set(optionKey, selectedText);
+      lastOpenedDropdownKey = optionKey;
+
+      dbg("handleClick:optionStored", {
+        optionKey,
+        storedValue: dropdownValueByControlKey.get(optionKey),
+        lastOpenedDropdownKey,
+      });
+    }
+  }
+
+  dbg("handleClick:optionSelected", {
+    selectedText,
+    ownerFound: !!owner,
+    optionKey,
+    lastOpenedDropdownKey,
+    mapBefore: optionKey ? dropdownValueByControlKey.get(optionKey) : null,
+  });
+
+  dbg("handleClick:optionSelected", {
+    selectedText,
+    ownerFound: !!owner,
+    optionKey,
+    lastOpenedDropdownKey,
+    mapBefore: dropdownValueByControlKey.get(optionKey),
+  });
 
   const isRadio =
     target.tagName === "INPUT" &&
