@@ -19,6 +19,141 @@ const RECORDER_UI_ATTR = "data-automation-recorder-ui";
 
 const CLICKABLE_INPUT_TYPES = new Set(["submit", "button", "reset"]);
 
+let pendingMeaningfulClick = null;
+let pendingMeaningfulClickPollId = null;
+let pendingMeaningfulClickObserver = null;
+
+const MEANINGFUL_CLICK_WINDOW_MS = 1400;
+const MEANINGFUL_CLICK_POLL_MS = 120;
+
+function getActivePaginationMarker() {
+  const el =
+    document.querySelector(
+      ".pagination .active, .page-item.active, .ant-pagination-item-active, " +
+        "[aria-current='page'], [data-active='true'], .Mui-selected",
+    ) || null;
+
+  return (el?.textContent || "").trim() || "";
+}
+
+function getUiTransitionSnapshot() {
+  return {
+    url: window.location.href,
+    title: document.title || "",
+    pageName: detectBestPageName() || "",
+    dialogCount: document.querySelectorAll(
+      "[role='dialog'], [aria-modal='true'], .modal, .MuiDialog-root, .ant-modal-root",
+    ).length,
+    drawerCount: document.querySelectorAll(
+      "aside[open], .drawer.open, .MuiDrawer-root, .ant-drawer-open",
+    ).length,
+    expandedCount: document.querySelectorAll(
+      "[aria-expanded='true'], details[open], .show, .open, .Mui-expanded, .ant-select-open, .ant-dropdown-open",
+    ).length,
+    paginationMarker: getActivePaginationMarker(),
+  };
+}
+
+function hasMeaningfulUiChange(before, after) {
+  if (!before || !after) return false;
+
+  return (
+    before.url !== after.url ||
+    before.title !== after.title ||
+    before.pageName !== after.pageName ||
+    before.dialogCount !== after.dialogCount ||
+    before.drawerCount !== after.drawerCount ||
+    before.expandedCount !== after.expandedCount ||
+    before.paginationMarker !== after.paginationMarker
+  );
+}
+
+function clearPendingMeaningfulClick() {
+  pendingMeaningfulClick = null;
+
+  if (pendingMeaningfulClickPollId) {
+    clearInterval(pendingMeaningfulClickPollId);
+    pendingMeaningfulClickPollId = null;
+  }
+
+  if (pendingMeaningfulClickObserver) {
+    pendingMeaningfulClickObserver.disconnect();
+    pendingMeaningfulClickObserver = null;
+  }
+}
+
+function commitPendingMeaningfulClick(reason) {
+  if (!pendingMeaningfulClick) return;
+
+  const after = getUiTransitionSnapshot();
+  const step = {
+    ...pendingMeaningfulClick.step,
+    pageUrl: after.url || pendingMeaningfulClick.step.pageUrl,
+    pageTitle: after.title || pendingMeaningfulClick.step.pageTitle,
+    pageName: after.pageName || pendingMeaningfulClick.step.pageName,
+    context:
+      pendingMeaningfulClick.step.context &&
+      typeof pendingMeaningfulClick.step.context === "object"
+        ? {
+            ...pendingMeaningfulClick.step.context,
+            transitionReason: reason,
+          }
+        : pendingMeaningfulClick.step.context,
+  };
+
+  steps.push(step);
+  lastClick = {
+    selector: pendingMeaningfulClick.selectorKey,
+    time: nowTs(),
+  };
+
+  clearPendingMeaningfulClick();
+  drainPendingInputs();
+  sendFlush(false);
+}
+
+function armMeaningfulClickCommit(step, selectorKey) {
+  clearPendingMeaningfulClick();
+
+  pendingMeaningfulClick = {
+    step,
+    selectorKey,
+    startedAt: nowTs(),
+    before: getUiTransitionSnapshot(),
+  };
+
+  pendingMeaningfulClickObserver = new MutationObserver(() => {
+    if (!pendingMeaningfulClick) return;
+    const after = getUiTransitionSnapshot();
+    if (hasMeaningfulUiChange(pendingMeaningfulClick.before, after)) {
+      commitPendingMeaningfulClick("mutation");
+    }
+  });
+
+  pendingMeaningfulClickObserver.observe(document.body, {
+    subtree: true,
+    childList: true,
+    attributes: true,
+    attributeFilter: ["class", "style", "aria-expanded", "aria-hidden", "open"],
+  });
+
+  pendingMeaningfulClickPollId = window.setInterval(() => {
+    if (!pendingMeaningfulClick) return;
+
+    const age = nowTs() - pendingMeaningfulClick.startedAt;
+    const after = getUiTransitionSnapshot();
+
+    if (hasMeaningfulUiChange(pendingMeaningfulClick.before, after)) {
+      commitPendingMeaningfulClick("poll");
+      return;
+    }
+
+    if (age >= MEANINGFUL_CLICK_WINDOW_MS) {
+      clearPendingMeaningfulClick();
+    }
+  }, MEANINGFUL_CLICK_POLL_MS);
+}
+
 // ── Utils ─────────────────────────────────────────────────────────────────────
 
 //Debugging helper
@@ -1108,6 +1243,22 @@ function getElementValue(el) {
   return el.textContent?.trim() ?? null;
 }
 
+function getElementValues(el) {
+  if (!el) return null;
+
+  // Native multi-select
+  if (el.tagName === "SELECT" && el.multiple) {
+    return Array.from(el.selectedOptions || [])
+      .map((opt) => (opt?.value ?? "").toString().trim())
+      .filter(Boolean);
+  }
+
+  // Fallback: single value as one-item array when needed
+  const single = getElementValue(el);
+  if (single == null || String(single).trim() === "") return [];
+  return [String(single)];
+}
+
 //selector helpers
 function getSelectorKeyFromElement(el) {
   if (!(el instanceof Element)) return "";
@@ -1244,6 +1395,8 @@ function isInputElement(el) {
 }
 
 function resolveClickTarget(rawEl) {
+  if (!(rawEl instanceof Element)) return null;
+
   if (rawEl.tagName === "INPUT") {
     const type = (rawEl.getAttribute("type") || "text").toLowerCase();
     if (type === "radio" || type === "checkbox") {
@@ -1257,19 +1410,52 @@ function resolveClickTarget(rawEl) {
 
   let el = rawEl;
   let walked = 0;
+
   while (el && el !== document.body && walked < MAX_ANCESTOR_WALK) {
     if (!(el instanceof Element)) {
       el = el.parentElement;
       walked++;
       continue;
     }
+
     const tag = el.tagName;
+    const role = (el.getAttribute("role") || "").toLowerCase();
+    const tabIndex = el.getAttribute("tabindex");
+    const className =
+      typeof el.className === "string" ? el.className.toLowerCase() : "";
+
+    const hasTransitionHint =
+      el.hasAttribute("aria-controls") ||
+      el.hasAttribute("aria-expanded") ||
+      el.hasAttribute("data-bs-toggle") ||
+      el.hasAttribute("data-toggle") ||
+      el.hasAttribute("data-testid") ||
+      el.hasAttribute("data-qa");
+
+    const looksLikePagination =
+      /\bpagination\b|\bpage-item\b|\bpager\b|\bnext\b|\bprev\b|\bprevious\b/.test(
+        className,
+      );
+
+    const looksLikeInteractiveContainer =
+      /\blist-item\b|\bmenu-item\b|\bnav-item\b|\btab\b|\bdrawer-item\b/.test(
+        className,
+      );
+
+    const hasPointerCursor = (() => {
+      try {
+        return window.getComputedStyle(el).cursor === "pointer";
+      } catch {
+        return false;
+      }
+    })();
+
+    const hasVisualClickSignal =
+      !!getDirectTextContent(el) || !!el.querySelector("svg, img");
 
     if (tag === "BUTTON") return el;
 
-    if (tag === "A" && (el.hasAttribute("href") || el.getAttribute("role"))) {
-      return el;
-    }
+    if (tag === "A" && (el.hasAttribute("href") || role)) return el;
 
     if (tag === "INPUT") {
       const type = (el.getAttribute("type") || "text").toLowerCase();
@@ -1308,7 +1494,6 @@ function resolveClickTarget(rawEl) {
       return null;
     }
 
-    const role = el.getAttribute("role");
     if (
       role === "button" ||
       role === "link" ||
@@ -1317,6 +1502,19 @@ function resolveClickTarget(rawEl) {
       role === "option" ||
       role === "checkbox" ||
       role === "radio"
+    ) {
+      return el;
+    }
+
+    if (tabIndex && tabIndex !== "-1") return el;
+
+    if (hasTransitionHint) return el;
+
+    if (
+      hasPointerCursor &&
+      (looksLikePagination ||
+        looksLikeInteractiveContainer ||
+        hasVisualClickSignal)
     ) {
       return el;
     }
@@ -1339,49 +1537,124 @@ function resolveClickTarget(rawEl) {
   return null;
 }
 
+//Helpers
+function normalizeLabelText(text) {
+  if (!text) return null;
+  const cleaned = String(text).replace(/\s+/g, " ").trim();
+  if (!cleaned) return null;
+  if (cleaned.length > 80) return null;
+  return cleaned;
+}
+
+function getTableAwareLabel(element) {
+  const cell = element.closest("th, td");
+  if (!cell) return null;
+
+  const ownText = normalizeLabelText(cell.textContent);
+
+  // Header cells: use the header text itself.
+  if (cell.tagName === "TH") {
+    return ownText;
+  }
+
+  // Data cells: prefer column header, fallback to cell text.
+  const table = cell.closest("table");
+  if (!table) return ownText;
+
+  const row = cell.closest("tr");
+  if (!row) return ownText;
+
+  const colIndex = Array.from(row.children).indexOf(cell);
+  if (colIndex < 0) return ownText;
+
+  const headerRow =
+    table.querySelector("thead tr") || table.querySelector("tr");
+  if (!headerRow) return ownText;
+
+  const headerCell = headerRow.children[colIndex];
+  const headerText = normalizeLabelText(headerCell?.textContent);
+  return headerText || ownText;
+}
+
+function isRiskyForSiblingFallback(element) {
+  return !!element.closest(
+    "table, thead, tbody, tr, th, td, " +
+      "[role='grid'], [role='row'], [role='table'], " +
+      "ul, ol, li, [role='list'], [role='menu'], " +
+      "nav, [role='tablist'], [role='tabpanel'], " +
+      ".card, .panel, .list-group, .menu, .navbar, .sidebar",
+  );
+}
+
 // ── Label / Name Discovery ────────────────────────────────────────────────────
 function findLabelText(element) {
+  // 1) Table-aware first: avoids off-by-one sibling mistakes.
+  const tableLabel = getTableAwareLabel(element);
+  if (tableLabel) return tableLabel;
+
+  // 2) Explicit label targeting.
   const id = element.id;
   if (id) {
     const label = document.querySelector(`label[for="${CSS.escape(id)}"]`);
-    const text = label?.textContent?.trim();
-    if (text && text.length < 60) return text;
+    const text = normalizeLabelText(label?.textContent);
+    if (text) return text;
   }
+
+  // 3) Wrapped label.
   const wrappingLabel = element.closest("label");
   if (wrappingLabel) {
     const clone = wrappingLabel.cloneNode(true);
     clone
-      .querySelectorAll("input, textarea, select")
+      .querySelectorAll("input, textarea, select, button")
       .forEach((i) => i.remove());
-    const text = clone.textContent?.trim();
-    if (text && text.length < 60) return text;
+    const text = normalizeLabelText(clone.textContent);
+    if (text) return text;
   }
-  const ariaLabel = element.getAttribute("aria-label");
-  if (ariaLabel && ariaLabel.length < 60) return ariaLabel;
+
+  // 4) ARIA-based.
+  const ariaLabel = normalizeLabelText(element.getAttribute("aria-label"));
+  if (ariaLabel) return ariaLabel;
+
   const ariaLabelledBy = element.getAttribute("aria-labelledby");
   if (ariaLabelledBy) {
     const labelEl = document.getElementById(ariaLabelledBy);
-    const text = labelEl?.textContent?.trim();
-    if (text && text.length < 60) return text;
+    const text = normalizeLabelText(labelEl?.textContent);
+    if (text) return text;
   }
-  const placeholder = element.getAttribute("placeholder");
-  if (placeholder && placeholder.length < 60) return placeholder;
-  const prev = element.previousElementSibling;
-  if (prev) {
-    const text = prev.textContent?.trim();
-    if (text && text.length < 60) return text;
+
+  // 5) Placeholder / name.
+  const placeholder = normalizeLabelText(element.getAttribute("placeholder"));
+  if (placeholder) return placeholder;
+
+  const nameAttr = element.getAttribute("name");
+  if (nameAttr && !/\d{3,}/.test(nameAttr)) {
+    const text = normalizeLabelText(nameAttr);
+    if (text) return text;
   }
-  const parent = element.parentElement;
-  if (parent) {
-    for (const node of parent.childNodes) {
-      if (node.nodeType === Node.TEXT_NODE) {
-        const text = node.textContent?.trim();
-        if (text && text.length > 1 && text.length < 60) return text;
+
+  // 6) Previous sibling fallback ONLY in safe contexts.
+  if (!isRiskyForSiblingFallback(element)) {
+    const prev = element.previousElementSibling;
+    if (prev && prev.tagName === "LABEL") {
+      const text = normalizeLabelText(prev.textContent);
+      if (text) return text;
+    }
+  }
+
+  // 7) Parent text-node fallback ONLY for form-like contexts.
+  const formLike = element.closest("form, fieldset");
+  if (formLike && !isRiskyForSiblingFallback(element)) {
+    const parent = element.parentElement;
+    if (parent) {
+      for (const node of parent.childNodes) {
+        if (node.nodeType === Node.TEXT_NODE) {
+          const text = normalizeLabelText(node.textContent);
+          if (text && text.length > 1) return text;
+        }
       }
     }
   }
-  const nameAttr = element.getAttribute("name");
-  if (nameAttr && !/\d{3,}/.test(nameAttr)) return nameAttr;
+
   return null;
 }
 
@@ -1404,6 +1677,25 @@ function generateVariableName(element, kind) {
 
   const label = findLabelText(element);
   const prefix = kind === "output" ? "out" : "in";
+
+  const tableLabel = getTableAwareLabel(element);
+  if (tableLabel) {
+    const cleaned = tableLabel
+      .replace(/[^a-zA-Z0-9\s]/g, "")
+      .trim()
+      .toLowerCase();
+
+    const tokens = cleaned.split(/\s+/).filter(Boolean);
+    if (tokens.length) {
+      const camel =
+        tokens[0] +
+        tokens
+          .slice(1)
+          .map((t) => t.charAt(0).toUpperCase() + t.slice(1))
+          .join("");
+      return `${prefix}_${camel}`.slice(0, 50);
+    }
+  }
 
   if (label) {
     const cleaned = label
@@ -1502,28 +1794,20 @@ function buildVariableSavedStep(variable) {
 function normalizeVariableTarget(rawEl) {
   if (!(rawEl instanceof Element)) return null;
 
-  // Table-first resolution: avoid capturing entire table text
-  const tableCell = rawEl.closest("td, th");
-  if (tableCell) return tableCell;
-
-  const tableRow = rawEl.closest("tr");
-  if (tableRow) return tableRow;
-
-  if (rawEl.tagName === "TABLE") {
-    const firstRow = rawEl.querySelector("tbody tr, tr");
-    if (firstRow) return firstRow;
-  }
-
-  // Direct native controls
-  if (
-    rawEl.tagName === "INPUT" ||
-    rawEl.tagName === "TEXTAREA" ||
-    rawEl.tagName === "SELECT"
-  ) {
+  // 1) Narrow first: if clicked element is already a form control, use it.
+  if (isInputElement(rawEl)) {
     return rawEl;
   }
 
-  // Click on option text/item -> resolve to owning control
+  // 2) Narrow down: find an input-like descendant inside the clicked node.
+  const embeddedInput = rawEl.querySelector(
+    "input, textarea, select, [contenteditable='true']",
+  );
+  if (embeddedInput instanceof Element && isInputElement(embeddedInput)) {
+    return embeddedInput;
+  }
+
+  // 3) Option-like elements -> resolve to owning dropdown control.
   const optionLike = rawEl.closest(
     "option, [role='option'], .ant-select-item-option, .MuiMenuItem-root, .mat-option, .react-select__option",
   );
@@ -1542,7 +1826,7 @@ function normalizeVariableTarget(rawEl) {
     if (nearbyCombobox) return nearbyCombobox;
   }
 
-  // Click on selected value text/chip inside custom dropdown
+  // 4) Selected-value chip/text inside custom dropdown.
   const selectedValueLike = rawEl.closest(
     ".ant-select-selection-item, .react-select__single-value, .MuiSelect-select, .ng-value-label, [aria-live='polite']",
   );
@@ -1553,38 +1837,47 @@ function normalizeVariableTarget(rawEl) {
     if (container) return container;
   }
 
-  // Wrapped by label
+  // 5) Label-wrapped controls.
   const label = rawEl.closest("label");
   if (label) {
     const forAttr = label.getAttribute("for");
     if (forAttr) {
       const linked = document.getElementById(forAttr);
-      if (
-        linked &&
-        (linked.tagName === "INPUT" ||
-          linked.tagName === "TEXTAREA" ||
-          linked.tagName === "SELECT")
-      ) {
+      if (linked && isInputElement(linked)) {
         return linked;
       }
     }
 
     const wrapped = label.querySelector("input, textarea, select");
-    if (wrapped) return wrapped;
+    if (wrapped instanceof Element && isInputElement(wrapped)) {
+      return wrapped;
+    }
   }
 
-  // Generic dropdown control wrappers
+  // 6) Generic dropdown wrappers.
   const dropdownControl = rawEl.closest(
     "select, [role='combobox'], [aria-haspopup='listbox'], .ant-select-selector, .react-select__control, .MuiSelect-select, .ng-select-container",
   );
   if (dropdownControl) return dropdownControl;
 
-  // Custom radio/checkbox wrappers
+  // 7) Custom radio/checkbox wrappers.
   const embeddedRadio = rawEl.querySelector('input[type="radio"]');
   if (embeddedRadio) return embeddedRadio;
 
   const embeddedCheckbox = rawEl.querySelector('input[type="checkbox"]');
   if (embeddedCheckbox) return embeddedCheckbox;
+
+  // 8) Table fallback only as last resort.
+  const tableCell = rawEl.closest("td, th");
+  if (tableCell) {
+    const inputInCell = tableCell.querySelector(
+      "input, textarea, select, [contenteditable='true']",
+    );
+    if (inputInCell instanceof Element && isInputElement(inputInCell)) {
+      return inputInCell;
+    }
+    return tableCell;
+  }
 
   return rawEl;
 }
@@ -1727,12 +2020,29 @@ function createVariable(kind) {
   const finalPageName = userPage.trim() || detectedPageName;
 
   let enumValues = null;
+  let selectedValue = null;
+  let selectedValues = null;
+  let isMultiSelect = false;
 
   if (el.tagName === "SELECT") {
     enumValues = Array.from(el.options).map((opt) => ({
       value: opt.value,
-      label: opt.textContent?.trim() || opt.value,
+      label: (opt.textContent || opt.value || "").trim(),
     }));
+
+    if (el.multiple) {
+      isMultiSelect = true;
+      selectedValues = Array.from(el.selectedOptions || [])
+        .map((opt) => (opt?.value ?? "").toString().trim())
+        .filter(Boolean);
+      selectedValue = selectedValues[0] || null;
+      finalValue = selectedValues; // keep structured selection in payload
+    } else {
+      const selectedIdx = el.selectedIndex;
+      if (selectedIdx >= 0 && enumValues[selectedIdx]) {
+        selectedValue = enumValues[selectedIdx].value;
+      }
+    }
   }
 
   if (el.tagName === "INPUT" && inputType === "radio") {
@@ -1748,6 +2058,10 @@ function createVariable(kind) {
           label: optLabel,
         };
       });
+
+      if (el.checked) {
+        selectedValue = el.getAttribute("value") || getRadioSelectedLabel(el);
+      }
     }
   }
 
@@ -1760,6 +2074,9 @@ function createVariable(kind) {
     dataType,
     context,
     enumValues,
+    selectedValue,
+    selectedValues,
+    isMultiSelect,
     capture,
     targetTag: el.tagName.toLowerCase(),
     inputType: el.getAttribute("type") || null,
@@ -2021,9 +2338,18 @@ function handleClick(event) {
   const isRadio =
     target.tagName === "INPUT" &&
     (target.getAttribute("type") || "").toLowerCase() === "radio";
+
   const isCheckbox =
     target.tagName === "INPUT" &&
     (target.getAttribute("type") || "").toLowerCase() === "checkbox";
+
+  const isSubmitLike =
+    (target.tagName === "BUTTON" &&
+      (target.getAttribute("type") === "submit" ||
+        !target.getAttribute("type"))) ||
+    (target.tagName === "INPUT" &&
+      (target.getAttribute("type") || "").toLowerCase() === "submit");
+
   const isButtonLike =
     target.tagName === "BUTTON" ||
     (target.tagName === "INPUT" &&
@@ -2043,7 +2369,7 @@ function handleClick(event) {
     const label = getCheckboxLabel(target);
     value = `${label}: ${target.checked ? "checked" : "unchecked"}`;
   } else if (isButtonLike) {
-    value = null; // do not show in value column
+    value = null;
   } else {
     value =
       target.getAttribute("aria-label") ||
@@ -2053,37 +2379,47 @@ function handleClick(event) {
   }
 
   const step = createStep(stepType, target, value);
-  if (step) {
-    if (isRadio || isCheckbox) {
-      step.inputType = (target.getAttribute("type") || "").toLowerCase();
-      step.checked = target.checked;
-      step.fieldName = target.getAttribute("name") || null;
-    }
+  if (!step) return;
 
-    if (isButtonLike) {
-      step.value = null;
-      step.buttonValue =
-        getButtonData(target)?.text ||
-        getButtonData(target)?.value ||
-        getDirectTextContent(target) ||
-        null;
-    }
+  if (isRadio || isCheckbox) {
+    step.inputType = (target.getAttribute("type") || "").toLowerCase();
+    step.checked = target.checked;
+    step.fieldName = target.getAttribute("name") || null;
 
     steps.push(step);
     lastClick = { selector: css, time: now };
-
-    const mightNavigate =
-      target.tagName === "A" ||
-      (target.tagName === "BUTTON" &&
-        (target.getAttribute("type") === "submit" ||
-          !target.getAttribute("type"))) ||
-      (target.tagName === "INPUT" && target.getAttribute("type") === "submit");
-
-    if (mightNavigate) {
-      drainPendingInputs();
-      sendFlush(false);
-    }
+    drainPendingInputs();
+    sendFlush(false);
+    return;
   }
+
+  if (isButtonLike) {
+    step.value = null;
+    step.buttonValue =
+      getButtonData(target)?.text ||
+      getButtonData(target)?.value ||
+      getDirectTextContent(target) ||
+      null;
+  }
+
+  if (isOptionLike(target)) {
+    steps.push(step);
+    lastClick = { selector: css, time: now };
+    drainPendingInputs();
+    sendFlush(false);
+    return;
+  }
+
+  // Let submit be recorded by handleSubmit so we do not double-log.
+  if (isSubmitLike) {
+    return;
+  }
+
+  // For generic click candidates, only save when the click causes a next UI step.
+  armMeaningfulClickCommit(
+    step,
+    css || step.selector?.relativeXPath || step.selector?.xpath || "",
+  );
 }
 
 function handleInput(event) {
@@ -2209,6 +2545,7 @@ function handleSubmit(event) {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 export function startRecording() {
+  clearPendingMeaningfulClick();
   if (isRecording) return;
   isRecording = true;
   steps = [];
@@ -2250,6 +2587,8 @@ export async function stopRecording() {
 
   drainPendingInputs();
   await sendFlush(true);
+
+  clearPendingMeaningfulClick();
 
   const result = {
     steps: compressSteps([...steps]),
