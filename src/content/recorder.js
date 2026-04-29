@@ -15,6 +15,8 @@ let lastOpenedDropdownKey = "";
 const CLICK_DEBOUNCE_MS = 300;
 const INPUT_DEBOUNCE_MS = 800;
 const FLUSH_INTERVAL_MS = 2000;
+const FALLBACK_MIN_CONFIDENCE = 3;
+const FALLBACK_MAX_ANCESTOR_WALK = 6;
 const RECORDER_UI_ATTR = "data-automation-recorder-ui";
 
 const CLICKABLE_INPUT_TYPES = new Set(["submit", "button", "reset"]);
@@ -25,6 +27,58 @@ let pendingMeaningfulClickObserver = null;
 
 const MEANINGFUL_CLICK_WINDOW_MS = 1400;
 const MEANINGFUL_CLICK_POLL_MS = 120;
+
+let pendingSubmitLikeClick = null;
+let pendingSubmitLikeClickTimerId = null;
+const SUBMIT_RECONCILE_MS = 220;
+
+function clearPendingSubmitLikeClick() {
+  pendingSubmitLikeClick = null;
+  if (pendingSubmitLikeClickTimerId) {
+    clearTimeout(pendingSubmitLikeClickTimerId);
+    pendingSubmitLikeClickTimerId = null;
+  }
+}
+
+function commitPendingSubmitLikeClick(reason) {
+  if (!pendingSubmitLikeClick) return;
+
+  const { step, selectorKey } = pendingSubmitLikeClick;
+  const nextStep = {
+    ...step,
+    context:
+      step.context && typeof step.context === "object"
+        ? { ...step.context, submitReconciledAsClick: reason }
+        : step.context,
+  };
+
+  steps.push(nextStep);
+  lastClick = { selector: selectorKey, time: nowTs() };
+  clearPendingSubmitLikeClick();
+  drainPendingInputs();
+  sendFlush(false);
+}
+
+function armPendingSubmitLikeClick(step, selectorKey, formEl) {
+  clearPendingSubmitLikeClick();
+  pendingSubmitLikeClick = {
+    step,
+    selectorKey,
+    formEl,
+    startedAt: nowTs(),
+  };
+
+  pendingSubmitLikeClickTimerId = setTimeout(() => {
+    commitPendingSubmitLikeClick("timeout-no-submit");
+  }, SUBMIT_RECONCILE_MS);
+}
+
+function consumePendingSubmitLikeClickForForm(formEl) {
+  if (!pendingSubmitLikeClick) return false;
+  if (pendingSubmitLikeClick.formEl !== formEl) return false;
+  clearPendingSubmitLikeClick();
+  return true;
+}
 
 function getActivePaginationMarker() {
   const el =
@@ -37,6 +91,13 @@ function getActivePaginationMarker() {
 }
 
 function getUiTransitionSnapshot() {
+  const activeNavEl =
+    document.querySelector(
+      "[aria-current='page'], [aria-selected='true'], .active, .selected, .Mui-selected, .ant-menu-item-selected",
+    ) || null;
+
+  const mainHeadingEl = document.querySelector("main h1, h1, main h2, h2");
+
   return {
     url: window.location.href,
     title: document.title || "",
@@ -51,6 +112,8 @@ function getUiTransitionSnapshot() {
       "[aria-expanded='true'], details[open], .show, .open, .Mui-expanded, .ant-select-open, .ant-dropdown-open",
     ).length,
     paginationMarker: getActivePaginationMarker(),
+    selectedMarker: (activeNavEl?.textContent || "").trim().slice(0, 120),
+    primaryHeading: (mainHeadingEl?.textContent || "").trim().slice(0, 120),
   };
 }
 
@@ -64,7 +127,9 @@ function hasMeaningfulUiChange(before, after) {
     before.dialogCount !== after.dialogCount ||
     before.drawerCount !== after.drawerCount ||
     before.expandedCount !== after.expandedCount ||
-    before.paginationMarker !== after.paginationMarker
+    before.paginationMarker !== after.paginationMarker ||
+    before.selectedMarker !== after.selectedMarker ||
+    before.primaryHeading !== after.primaryHeading
   );
 }
 
@@ -1537,6 +1602,122 @@ function resolveClickTarget(rawEl) {
   return null;
 }
 
+function isDeadZoneElement(el) {
+  if (!(el instanceof Element)) return true;
+  const tag = el.tagName;
+  if (
+    tag === "HTML" ||
+    tag === "BODY" ||
+    tag === "MAIN" ||
+    tag === "SECTION" ||
+    tag === "ARTICLE"
+  ) {
+    return true;
+  }
+  if (isFromRecorderUi(el)) return true;
+  return false;
+}
+
+function getFallbackTargetConfidence(el) {
+  if (!(el instanceof Element)) return 0;
+  if (isDeadZoneElement(el)) return 0;
+  if (isInputElement(el)) return 0;
+
+  const role = (el.getAttribute("role") || "").toLowerCase();
+  const className =
+    typeof el.className === "string" ? el.className.toLowerCase() : "";
+  const id = (el.id || "").toLowerCase();
+
+  let score = 0;
+
+  if (
+    role === "button" ||
+    role === "link" ||
+    role === "menuitem" ||
+    role === "tab" ||
+    role === "option" ||
+    role === "treeitem"
+  ) {
+    score += 3;
+  }
+
+  if (
+    el.hasAttribute("aria-selected") ||
+    el.hasAttribute("aria-current") ||
+    el.hasAttribute("aria-controls") ||
+    el.hasAttribute("aria-expanded")
+  ) {
+    score += 3;
+  }
+
+  if (el.hasAttribute("onclick")) score += 2;
+
+  const tabIndex = el.getAttribute("tabindex");
+  if (tabIndex && tabIndex !== "-1") score += 2;
+
+  if (
+    /\bnav\b|\bmenu\b|\btab\b|\blist\b|\bitem\b|\bpager\b|\bbreadcrumb\b/.test(
+      className,
+    ) ||
+    /\bnav\b|\bmenu\b|\btab\b|\blist\b|\bitem\b|\bpager\b|\bbreadcrumb\b/.test(
+      id,
+    )
+  ) {
+    score += 1;
+  }
+
+  const inInteractiveContainer = !!el.closest(
+    "nav, [role='navigation'], [role='menu'], [role='tablist'], ul, ol, [data-testid], [data-qa]",
+  );
+  if (inInteractiveContainer) score += 1;
+
+  const hasPointerCursor = (() => {
+    try {
+      return window.getComputedStyle(el).cursor === "pointer";
+    } catch {
+      return false;
+    }
+  })();
+  if (hasPointerCursor) score += 1;
+
+  const text = (getDirectTextContent(el) || "").trim();
+  if (text && text.length <= 80) score += 1;
+
+  return score;
+}
+
+function resolveFallbackMeaningfulTarget(rawEl) {
+  if (!(rawEl instanceof Element)) return null;
+
+  let el = rawEl;
+  let walked = 0;
+  let best = null;
+  let bestScore = 0;
+
+  while (el && el !== document.body && walked < FALLBACK_MAX_ANCESTOR_WALK) {
+    if (!(el instanceof Element)) {
+      el = el.parentElement;
+      walked++;
+      continue;
+    }
+
+    const score = getFallbackTargetConfidence(el);
+    if (score > bestScore) {
+      bestScore = score;
+      best = el;
+    }
+
+    if (bestScore >= FALLBACK_MIN_CONFIDENCE) {
+      return best;
+    }
+
+    el = el.parentElement;
+    walked++;
+  }
+
+  return null;
+}
+
 //Helpers
 function normalizeLabelText(text) {
   if (!text) return null;
@@ -2271,7 +2452,11 @@ function handleClick(event) {
     lastOpenedDropdownKey,
   });
 
-  const target = resolveClickTarget(rawEl);
+  const resolvedTarget = resolveClickTarget(rawEl);
+  const fallbackTarget = resolvedTarget
+    ? null
+    : resolveFallbackMeaningfulTarget(rawEl);
+  const target = resolvedTarget || fallbackTarget;
 
   dbg("handleClick:resolvedTarget", {
     targetTag: target?.tagName || null,
@@ -2280,6 +2465,10 @@ function handleClick(event) {
     isOptionLike: target ? isOptionLike(target) : false,
     selectorKey: target ? getSelectorKeyFromElement(target) : "",
     targetText: (target?.textContent || "").trim().slice(0, 120),
+    viaFallback: !resolvedTarget && !!fallbackTarget,
+    fallbackScore: fallbackTarget
+      ? getFallbackTargetConfidence(fallbackTarget)
+      : 0,
   });
 
   if (!target) return;
@@ -2343,12 +2532,12 @@ function handleClick(event) {
     target.tagName === "INPUT" &&
     (target.getAttribute("type") || "").toLowerCase() === "checkbox";
 
+  const buttonType = (target.getAttribute("type") || "").toLowerCase();
+  const parentForm = target.closest("form");
   const isSubmitLike =
     (target.tagName === "BUTTON" &&
-      (target.getAttribute("type") === "submit" ||
-        !target.getAttribute("type"))) ||
-    (target.tagName === "INPUT" &&
-      (target.getAttribute("type") || "").toLowerCase() === "submit");
+      (buttonType === "submit" || (!buttonType && !!parentForm))) ||
+    (target.tagName === "INPUT" && buttonType === "submit");
 
   const isButtonLike =
     target.tagName === "BUTTON" ||
@@ -2400,6 +2589,29 @@ function handleClick(event) {
       getButtonData(target)?.value ||
       getDirectTextContent(target) ||
       null;
+  }
+
+  const isDisabledButton =
+    isButtonLike &&
+    (target.hasAttribute("disabled") ||
+      target.getAttribute("aria-disabled") === "true");
+
+  // Capture all enabled button clicks immediately.
+  // If it is a real submit-like button in a form, wait briefly and reconcile with submit.
+  if (isButtonLike && !isDisabledButton) {
+    const selectorKey =
+      css || step.selector?.relativeXPath || step.selector?.xpath || "";
+
+    if (isSubmitLike && parentForm) {
+      armPendingSubmitLikeClick(step, selectorKey, parentForm);
+      return;
+    }
+
+    steps.push(step);
+    lastClick = { selector: css, time: now };
+    drainPendingInputs();
+    sendFlush(false);
+    return;
   }
 
   if (isOptionLike(target)) {
@@ -2513,6 +2725,12 @@ function handleSubmit(event) {
   if (!(form instanceof HTMLFormElement)) return;
   if (isFromRecorderUi(form)) return;
 
+  if (consumePendingSubmitLikeClickForForm(form)) {
+    drainPendingInputs();
+    sendFlush(false);
+    return;
+  }
+
   const submitBtn =
     form.querySelector('button[type="submit"]') ||
     form.querySelector('input[type="submit"]') ||
@@ -2546,6 +2764,7 @@ function handleSubmit(event) {
 
 export function startRecording() {
   clearPendingMeaningfulClick();
+  clearPendingSubmitLikeClick();
   if (isRecording) return;
   isRecording = true;
   steps = [];
@@ -2575,6 +2794,7 @@ export async function stopRecording() {
   if (!isRecording) {
     return { steps: [], variables: [] };
   }
+  commitPendingSubmitLikeClick("stop-recording");
 
   isRecording = false;
   detachRouteObserver();
