@@ -1701,6 +1701,22 @@ function resolveFallbackMeaningfulTarget(rawEl) {
       continue;
     }
 
+    if (el.tagName === "LI") {
+      const inDropdown = el.closest(
+        '[role="listbox"], [role="option"], select, [data-dropdown]',
+      );
+      if (!inDropdown) {
+        try {
+          const hasClickableSignal =
+            window.getComputedStyle(el).cursor === "pointer" ||
+            (el.textContent && el.textContent.trim().length > 0);
+          if (hasClickableSignal) {
+            return el;
+          }
+        } catch {}
+      }
+    }
+
     const score = getFallbackTargetConfidence(el);
     if (score > bestScore) {
       bestScore = score;
