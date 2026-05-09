@@ -19,11 +19,19 @@ const FALLBACK_MIN_CONFIDENCE = 3;
 const FALLBACK_MAX_ANCESTOR_WALK = 6;
 const RECORDER_UI_ATTR = "data-automation-recorder-ui";
 
+const DROPDOWN_CONTROL_SELECTOR =
+  "select, [role='combobox'], [aria-haspopup='listbox'], " +
+  ".ant-select-selector, .react-select__control, [class*='-control'], " +
+  ".MuiSelect-select, .ng-select-container";
+
+const DROPDOWN_OPEN_DEDUPE_MS = 700;
+
 const CLICKABLE_INPUT_TYPES = new Set(["submit", "button", "reset"]);
 
 let pendingMeaningfulClick = null;
 let pendingMeaningfulClickPollId = null;
 let pendingMeaningfulClickObserver = null;
+let lastPointerDownDropdownOpen = { key: "", time: 0, consumed: false };
 
 const MEANINGFUL_CLICK_WINDOW_MS = 1400;
 const MEANINGFUL_CLICK_POLL_MS = 120;
@@ -98,6 +106,18 @@ function getUiTransitionSnapshot() {
 
   const mainHeadingEl = document.querySelector("main h1, h1, main h2, h2");
 
+  const openDropdownEls = Array.from(
+    document.querySelectorAll(
+      "[role='listbox'], [role='menu'], .react-select__menu, .ant-select-dropdown, .ant-dropdown-menu, .MuiMenu-list",
+    ),
+  );
+
+  const expandedComboboxEls = Array.from(
+    document.querySelectorAll(
+      "[role='combobox'][aria-expanded='true'], [aria-haspopup='listbox'][aria-expanded='true'], .react-select__control--menu-is-open, .ant-select-open, .MuiSelect-select[aria-expanded='true']",
+    ),
+  );
+
   return {
     url: window.location.href,
     title: document.title || "",
@@ -111,10 +131,17 @@ function getUiTransitionSnapshot() {
     expandedCount: document.querySelectorAll(
       "[aria-expanded='true'], details[open], .show, .open, .Mui-expanded, .ant-select-open, .ant-dropdown-open",
     ).length,
+    dropdownMenuCount: openDropdownEls.length,
+    expandedComboboxCount: expandedComboboxEls.length,
     paginationMarker: getActivePaginationMarker(),
     selectedMarker: (activeNavEl?.textContent || "").trim().slice(0, 120),
     primaryHeading: (mainHeadingEl?.textContent || "").trim().slice(0, 120),
   };
+}
+
+function isDropdownControlElement(el) {
+  if (!(el instanceof Element)) return false;
+  return !!el.closest(DROPDOWN_CONTROL_SELECTOR);
 }
 
 function hasMeaningfulUiChange(before, after) {
@@ -127,6 +154,8 @@ function hasMeaningfulUiChange(before, after) {
     before.dialogCount !== after.dialogCount ||
     before.drawerCount !== after.drawerCount ||
     before.expandedCount !== after.expandedCount ||
+    before.dropdownMenuCount !== after.dropdownMenuCount ||
+    before.expandedComboboxCount !== after.expandedComboboxCount ||
     before.paginationMarker !== after.paginationMarker ||
     before.selectedMarker !== after.selectedMarker ||
     before.primaryHeading !== after.primaryHeading
@@ -178,7 +207,9 @@ function commitPendingMeaningfulClick(reason) {
 }
 
 function armMeaningfulClickCommit(step, selectorKey) {
-  clearPendingMeaningfulClick();
+  if (pendingMeaningfulClick) {
+    commitPendingMeaningfulClick("superseded");
+  }
 
   pendingMeaningfulClick = {
     step,
@@ -228,9 +259,18 @@ function dbg(label, payload = {}) {
   if (!DEBUG_DROPDOWN_CAPTURE) return;
   try {
     console.log("[RECORDER][DROPDOWN]", label, payload);
-  } catch {
-    // no-op
-  }
+  } catch {}
+}
+
+function shortEl(el) {
+  if (!(el instanceof Element)) return null;
+  return {
+    tag: el.tagName,
+    role: el.getAttribute("role"),
+    id: el.id || null,
+    cls: typeof el.className === "string" ? el.className.slice(0, 120) : null,
+    text: (el.textContent || "").trim().slice(0, 120),
+  };
 }
 
 // ── Navigation flush: save steps before page unloads ──
@@ -979,10 +1019,16 @@ function toXPathLiteral(value) {
   if (!raw.includes('"')) return `"${raw}"`;
   if (!raw.includes("'")) return `'${raw}'`;
 
+  // String contains both quote types — use concat() to combine safe segments.
+  // Splitting on ' means no segment can contain ', so each can be single-quoted.
+  // Segments that contain " get double-quoted (they have no ' by definition of the split).
   const parts = raw.split("'");
   const chunks = [];
   for (let i = 0; i < parts.length; i++) {
-    chunks.push(`"${parts[i].replace(/"/g, '\\"')}"`);
+    if (parts[i].length > 0) {
+      // Each part has no ' in it (we split on '). Use double-quotes if it contains no ".
+      chunks.push(parts[i].includes('"') ? `'${parts[i]}'` : `"${parts[i]}"`);
+    }
     if (i < parts.length - 1) chunks.push(`"'"`);
   }
   return `concat(${chunks.join(", ")})`;
@@ -995,7 +1041,10 @@ function normalizeSpaceText(text) {
 }
 
 function isStableId(value) {
-  return !!value && !/\d{5,}/.test(value);
+  if (!value) return false;
+  if (/\d{5,}/.test(value)) return false;
+  if (/^react-select-\d+/i.test(value)) return false;
+  return true;
 }
 
 function isStableClassName(className) {
@@ -1400,6 +1449,32 @@ function getDropdownCacheKeyFromElement(el) {
   if (!selectorKey) return "";
   const pageKey = (window.location.pathname || "").trim() || "/";
   return pageKey + "::" + selectorKey;
+}
+
+function getStableDropdownOpenKey(controlEl) {
+  if (!(controlEl instanceof Element)) return "";
+  const node = controlEl.matches("input[role='combobox']")
+    ? controlEl
+    : controlEl.querySelector("input[role='combobox']") || controlEl;
+
+  const pageKey = (window.location.pathname || "").trim() || "/";
+
+  const dataKey =
+    node.getAttribute("data-testid") ||
+    node.getAttribute("data-test") ||
+    node.getAttribute("data-qa");
+  if (dataKey) return pageKey + "::dt:" + dataKey;
+
+  if (isStableId(node.id)) return pageKey + "::id:" + node.id;
+
+  const attrKey =
+    node.getAttribute("aria-controls") ||
+    node.getAttribute("name") ||
+    node.getAttribute("aria-label");
+  if (attrKey) return pageKey + "::attr:" + attrKey;
+
+  const xp = getXPath(node) || getXPath(controlEl) || "";
+  return xp ? pageKey + "::xp:" + xp : "";
 }
 
 // ── Radio / Checkbox value helpers ────────────────────────────────────────────
@@ -2374,6 +2449,14 @@ function sendFlush(isFinal) {
   const compressed = compressSteps([...steps]);
   const vars = [...variables];
 
+  dbg("flush:outgoing", {
+    isFinal,
+    stepsCount: compressed.length,
+    varsCount: vars.length,
+    lastStepType: compressed[compressed.length - 1]?.type || null,
+    lastStepCss: compressed[compressed.length - 1]?.selector?.css || null,
+  });
+
   if (!compressed.length && !vars.length) {
     return Promise.resolve();
   }
@@ -2388,6 +2471,11 @@ function sendFlush(isFinal) {
   return new Promise((resolve) => {
     try {
       chrome.runtime.sendMessage(payload, (res) => {
+        dbg("flush:ack", {
+          hasRuntimeError: !!chrome.runtime.lastError,
+          ack: res || null,
+        });
+
         if (chrome.runtime.lastError) {
           console.error(
             "[RECORDER][sendFlush] chrome.runtime.lastError:",
@@ -2430,6 +2518,58 @@ function drainPendingInputs() {
 
 // ── Event Handlers ────────────────────────────────────────────────────────────
 
+function handlePointerDown(event) {
+  const raw = event.target;
+  if (!isRecording) return;
+
+  // Left click / touch tap only
+  if (typeof event.button === "number" && event.button !== 0) return;
+
+  const rawEl = raw instanceof Element ? raw : raw?.parentElement;
+  dbg("pd:start", {
+    type: event.type,
+    button: event.button,
+    buttons: event.buttons,
+    pointerType: event.pointerType || "mouse",
+    target: shortEl(rawEl),
+  });
+  if (!rawEl) return;
+  if (isFromRecorderUi(rawEl)) return;
+
+  const openedDropdown = rawEl.closest(DROPDOWN_CONTROL_SELECTOR);
+  if (!openedDropdown) {
+    dbg("pd:skip:no-openedDropdown", {
+      target: shortEl(rawEl),
+    });
+    return;
+  }
+
+  dbg("pd:openedDropdown", {
+    opened: shortEl(openedDropdown),
+  });
+
+  const insideMenu = rawEl.closest(
+    '[role="listbox"], [role="menu"], .react-select__menu, .ant-select-dropdown, .ant-dropdown-menu',
+  );
+  if (insideMenu) {
+    dbg("pd:skip:insideMenu", {
+      insideMenu: shortEl(insideMenu),
+    });
+    return;
+  }
+
+  // Keep dropdown value cache behavior consistent with handleClick
+  const openKey = getDropdownCacheKeyFromElement(openedDropdown);
+  if (openKey) {
+    dropdownValueByControlKey.delete(openKey);
+    lastOpenedDropdownKey = openKey;
+  }
+
+  const pdKey = getStableDropdownOpenKey(openedDropdown);
+  lastPointerDownDropdownOpen = { key: pdKey, time: nowTs(), consumed: false };
+  return;
+}
+
 function handleClick(event) {
   const raw = event.target;
   if (!isRecording) return;
@@ -2445,9 +2585,7 @@ function handleClick(event) {
     rawText: (rawEl?.textContent || "").trim().slice(0, 120),
   });
 
-  const openedDropdown = rawEl.closest(
-    "select, [role='combobox'], [aria-haspopup='listbox'], .ant-select-selector, .react-select__control, .MuiSelect-select, .ng-select-container",
-  );
+  const openedDropdown = rawEl.closest(DROPDOWN_CONTROL_SELECTOR);
 
   if (openedDropdown) {
     const openKey = getDropdownCacheKeyFromElement(openedDropdown);
@@ -2472,7 +2610,33 @@ function handleClick(event) {
   const fallbackTarget = resolvedTarget
     ? null
     : resolveFallbackMeaningfulTarget(rawEl);
-  const target = resolvedTarget || fallbackTarget;
+  let target = resolvedTarget || fallbackTarget;
+
+  if (!target && openedDropdown) {
+    const insideMenu = rawEl.closest(
+      '[role="listbox"], [role="menu"], .react-select__menu, .ant-select-dropdown, .ant-dropdown-menu',
+    );
+    if (!insideMenu) {
+      let ctrl = openedDropdown;
+      if (
+        ctrl.tagName === "INPUT" &&
+        ctrl.getAttribute("role") === "combobox"
+      ) {
+        ctrl =
+          ctrl.closest(
+            ".react-select__control, .ant-select-selector, [aria-haspopup='listbox']",
+          ) || ctrl;
+      }
+      const {
+        css: ctrlCss,
+        xpath: ctrlXp,
+        relativeXPath: ctrlRel,
+      } = buildSelectors(ctrl);
+      if (ctrlCss || ctrlXp || ctrlRel) {
+        target = ctrl;
+      }
+    }
+  }
 
   dbg("handleClick:resolvedTarget", {
     targetTag: target?.tagName || null,
@@ -2530,14 +2694,6 @@ function handleClick(event) {
     optionKey,
     lastOpenedDropdownKey,
     mapBefore: optionKey ? dropdownValueByControlKey.get(optionKey) : null,
-  });
-
-  dbg("handleClick:optionSelected", {
-    selectedText,
-    ownerFound: !!owner,
-    optionKey,
-    lastOpenedDropdownKey,
-    mapBefore: dropdownValueByControlKey.get(optionKey),
   });
 
   const isRadio =
@@ -2631,8 +2787,43 @@ function handleClick(event) {
   }
 
   if (isOptionLike(target)) {
+    // add synthetic open if the last step wasn't already a control-open
+    const ownerControl = owner || findOwningDropdownControlFromOption(target);
+
+    if (ownerControl) {
+      const lastStep = steps[steps.length - 1];
+
+      // Check if last step is already a click on this dropdown control
+      const lastControlSelectors = lastStep
+        ? buildSelectors(ownerControl)
+        : null;
+      const isLastStepThisControlClick =
+        lastStep &&
+        lastStep.type === "click" &&
+        lastControlSelectors &&
+        ((lastStep.selector?.css &&
+          lastControlSelectors.css &&
+          lastStep.selector.css === lastControlSelectors.css) ||
+          (lastStep.selector?.xpath &&
+            lastControlSelectors.xpath &&
+            lastStep.selector.xpath === lastControlSelectors.xpath));
+
+      // Only insert synthetic open if last step wasn't already this control click
+      if (!isLastStepThisControlClick) {
+        const openStep = createStep("click", ownerControl, null);
+        if (openStep) {
+          steps.push(openStep);
+          dbg("dropdown:synthetic-open-inserted", {
+            control: shortEl(ownerControl),
+          });
+        }
+      }
+    }
+
+    // Record the selected option click
     steps.push(step);
     lastClick = { selector: css, time: now };
+    lastOpenedDropdownKey = "";
     drainPendingInputs();
     sendFlush(false);
     return;
@@ -2640,6 +2831,26 @@ function handleClick(event) {
 
   // Let submit be recorded by handleSubmit so we do not double-log.
   if (isSubmitLike) {
+    return;
+  }
+
+  const clickedInsideMenu = !!rawEl.closest(
+    '[role="listbox"], [role="menu"], .react-select__menu, .ant-select-dropdown, .ant-dropdown-menu',
+  );
+
+  const isDropdownOpenClick =
+    stepType === "click" &&
+    !isButtonLike &&
+    !isSubmitLike &&
+    !isOptionLike(target) &&
+    !clickedInsideMenu &&
+    isDropdownControlElement(target);
+
+  if (isDropdownOpenClick) {
+    steps.push(step);
+    lastClick = { selector: css, time: now };
+    drainPendingInputs();
+    sendFlush(false);
     return;
   }
 
@@ -2721,6 +2932,7 @@ function handleBlur(event) {
     const step = createStep("input", target, value);
     if (step) {
       steps.push(step);
+      sendFlush(false);
     }
   }
 }
@@ -2781,6 +2993,7 @@ function handleSubmit(event) {
 export function startRecording() {
   clearPendingMeaningfulClick();
   clearPendingSubmitLikeClick();
+  lastPointerDownDropdownOpen = { key: "", time: 0, consumed: false };
   if (isRecording) return;
   isRecording = true;
   steps = [];
@@ -2792,6 +3005,7 @@ export function startRecording() {
   attachRouteObserver();
 
   if (!listenersAttached) {
+    document.addEventListener("pointerdown", handlePointerDown, true);
     document.addEventListener("click", handleClick, true);
     document.addEventListener("input", handleInput, true);
     document.addEventListener("blur", handleBlur, true);
