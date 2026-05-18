@@ -310,46 +310,66 @@ function nowTs() {
 
 function getCssSelector(element) {
   if (!(element instanceof Element)) return null;
-  const id = element.id;
-  if (id && !/\d{3,}/.test(id)) {
-    return `#${CSS.escape(id)}`;
+
+  // Highest priority: test ids
+  const testId =
+    element.getAttribute("data-testid") ||
+    element.getAttribute("data-test") ||
+    element.getAttribute("data-qa");
+  if (testId) {
+    return `[data-testid="${CSS.escape(testId)}"],[data-test="${CSS.escape(testId)}"],[data-qa="${CSS.escape(testId)}"]`;
   }
+
+  // Stable id only
+  if (isStableId(element.id)) {
+    return `#${CSS.escape(element.id)}`;
+  }
+
+  // Stable class combo (max 2 to avoid brittle chains)
   if (element.classList.length) {
-    const cls = Array.from(element.classList)
-      .filter((c) => !/\d{3,}/.test(c))
-      .map((c) => `.${CSS.escape(c)}`)
-      .join("");
-    if (cls) {
+    const stableClasses = Array.from(element.classList)
+      .filter(isStableClassName)
+      .slice(0, 2);
+    if (stableClasses.length) {
+      const cls = stableClasses.map((c) => `.${CSS.escape(c)}`).join("");
       return `${element.tagName.toLowerCase()}${cls}`;
     }
   }
+
+  // Conservative fallback path
   let path = "";
   let el = element;
-  while (el && el.nodeType === Node.ELEMENT_NODE) {
+  let depth = 0;
+  while (el && el.nodeType === Node.ELEMENT_NODE && depth < 5) {
     let selector = el.tagName.toLowerCase();
-    if (el.id) {
+
+    if (isStableId(el.id)) {
       selector += `#${CSS.escape(el.id)}`;
       path = selector + (path ? " > " + path : "");
       break;
-    } else {
-      let sibling = el;
-      let index = 1;
-      while ((sibling = sibling.previousElementSibling)) {
-        if (sibling.tagName === el.tagName) index++;
-      }
-      selector += `:nth-of-type(${index})`;
     }
+
+    let sibling = el;
+    let index = 1;
+    while ((sibling = sibling.previousElementSibling)) {
+      if (sibling.tagName === el.tagName) index++;
+    }
+    selector += `:nth-of-type(${index})`;
+
     path = selector + (path ? " > " + path : "");
     el = el.parentElement;
+    depth++;
   }
+
   return path || null;
 }
 
 function getXPath(element) {
   if (!(element instanceof Element)) return null;
-  let segs = [];
+  const segs = [];
+
   for (; element && element.nodeType === 1; element = element.parentNode) {
-    if (element.hasAttribute("id")) {
+    if (isStableId(element.getAttribute("id"))) {
       segs.unshift(
         `//*[@id="${element.getAttribute("id").replace(/"/g, '\\"')}"]`,
       );
@@ -363,6 +383,7 @@ function getXPath(element) {
       segs.unshift(`${element.nodeName.toLowerCase()}[${i}]`);
     }
   }
+
   return segs.length ? "/" + segs.join("/") : null;
 }
 
@@ -1042,26 +1063,46 @@ function normalizeSpaceText(text) {
 
 function isStableId(value) {
   if (!value) return false;
-  if (/\d{5,}/.test(value)) return false;
-  if (/^react-select-\d+/i.test(value)) return false;
+
+  const v = String(value).trim();
+  if (!v) return false;
+
+  // Dynamic libraries / generated ids
+  if (/^(react-select|headlessui|radix|mui|ant|chakra)-/i.test(v)) return false;
+
+  // UUID-like or long random chunks
+  if (/^[a-f0-9]{8,}$/i.test(v)) return false;
+  if (/^[a-f0-9-]{16,}$/i.test(v)) return false;
+
+  // Heavy numeric / index-like ids
+  if (/\d{5,}/.test(v)) return false;
+  if (/(^|[-_])\d{3,}($|[-_])/.test(v)) return false;
+
   return true;
 }
 
 function isStableClassName(className) {
   if (!className || className.length < 3) return false;
-  if (/\d{3,}/.test(className)) return false;
+
+  const c = String(className).trim();
+
+  // Dynamic css-in-js / hashed names
   if (
-    /^(active|selected|open|focus|focused|hover|show|visible)$/i.test(className)
+    /^(css|jss|sc|emotion|chakra|mui)-[a-z0-9]{4,}$/i.test(c) ||
+    /(^|[-_])(css|jss|hash|generated)[-_][a-z0-9]{4,}/i.test(c)
   ) {
     return false;
   }
-  if (
-    /(^|[-_])(active|selected|open|focus|hover|show|visible)([-_]|$)/i.test(
-      className,
-    )
-  ) {
+
+  // Too numeric or state-only classes
+  if (/\d{3,}/.test(c)) return false;
+  if (/^(active|selected|open|focus|focused|hover|show|visible)$/i.test(c))
     return false;
-  }
+  if (
+    /(^|[-_])(active|selected|open|focus|hover|show|visible)([-_]|$)/i.test(c)
+  )
+    return false;
+
   return true;
 }
 
@@ -1271,6 +1312,81 @@ function buildSelectors(element) {
   const xpath = getXPath(element);
   const relativeXPath = getRelativeXPath(element);
   return { css, xpath, relativeXPath };
+}
+
+function buildSelectorCandidates(element) {
+  if (!(element instanceof Element)) return [];
+
+  const out = [];
+  const add = (kind, value, confidence) => {
+    const v = (value || "").trim();
+    if (!v) return;
+    out.push({ kind, value: v, confidence });
+  };
+
+  const testId =
+    element.getAttribute("data-testid") ||
+    element.getAttribute("data-test") ||
+    element.getAttribute("data-qa");
+  if (testId) {
+    add(
+      "data-testid",
+      `//*[@data-testid=${toXPathLiteral(testId)} or @data-test=${toXPathLiteral(testId)} or @data-qa=${toXPathLiteral(testId)}]`,
+      100,
+    );
+  }
+
+  if (isStableId(element.id)) {
+    add("id", `//*[@id=${toXPathLiteral(element.id)}]`, 95);
+  }
+
+  const role = element.getAttribute("role");
+  const aria = element.getAttribute("aria-label");
+  if (role && aria) {
+    add(
+      "role+aria",
+      `//*[@role=${toXPathLiteral(role)} and @aria-label=${toXPathLiteral(aria)}]`,
+      90,
+    );
+  }
+
+  const name = element.getAttribute("name");
+  if (name && !/\d{5,}/.test(name)) {
+    add(
+      "name",
+      `//${element.tagName.toLowerCase()}[@name=${toXPathLiteral(name)}]`,
+      88,
+    );
+  }
+
+  const text = normalizeSpaceText(
+    getDirectTextContent(element) || element.textContent || "",
+  );
+  if (text && text.length <= 80) {
+    add(
+      "text",
+      `//${element.tagName.toLowerCase()}[normalize-space(.)=${toXPathLiteral(text)}]`,
+      82,
+    );
+  }
+
+  const relativeXPath = getRelativeXPath(element);
+  if (relativeXPath) add("relativeXPath", relativeXPath, 80);
+
+  const css = getCssSelector(element);
+  if (css) add("css", css, 75);
+
+  const xpath = getXPath(element);
+  if (xpath) add("xpath", xpath, 60);
+
+  // Deduplicate by value, keep highest confidence
+  const dedup = new Map();
+  for (const item of out) {
+    const prev = dedup.get(item.value);
+    if (!prev || item.confidence > prev.confidence) dedup.set(item.value, item);
+  }
+
+  return Array.from(dedup.values()).sort((a, b) => b.confidence - a.confidence);
 }
 
 function getElementValue(el) {
@@ -1994,27 +2110,63 @@ function generateVariableName(element, kind) {
 
 // ── Step & Variable Creation ──────────────────────────────────────────────────
 function createStep(type, element, value = null) {
-  if (!element) {
-    return null;
-  }
+  if (!element) return null;
+
   const { css, xpath, relativeXPath } = buildSelectors(element);
-  if (!css && !xpath && !relativeXPath) {
+  const selectorCandidates = buildSelectorCandidates(element);
+
+  if (!css && !xpath && !relativeXPath && selectorCandidates.length === 0) {
     return null;
   }
 
   const pageName = getPageName();
-  const context = detectVariableContext(element);
+  const baseContext = detectVariableContext(element);
+  const contextObj =
+    typeof baseContext === "object"
+      ? { ...baseContext }
+      : { type: baseContext };
+
+  const rawText = (element.textContent || "").toLowerCase();
+  const ariaLabel = (element.getAttribute("aria-label") || "").toLowerCase();
+
+  const transientUi = !!element.closest(
+    "[role='dialog'], [role='alertdialog'], [role='tooltip'], [role='menu'], [role='listbox'], " +
+      ".ant-popover, .ant-tooltip, .react-joyride__tooltip, .toast, .snackbar",
+  );
+
+  const dismissiveAction =
+    /close|dismiss|skip|got it|cancel|not now|x/.test(rawText) ||
+    /close|dismiss|skip|cancel|not now/.test(ariaLabel);
 
   const step = {
     type,
     selector: { css, xpath, relativeXPath },
+    selectorCandidates,
+    selectorMeta: {
+      primary:
+        selectorCandidates[0]?.value || relativeXPath || css || xpath || null,
+      primaryKind:
+        selectorCandidates[0]?.kind ||
+        (relativeXPath
+          ? "relativeXPath"
+          : css
+            ? "css"
+            : xpath
+              ? "xpath"
+              : "unknown"),
+      candidateCount: selectorCandidates.length,
+    },
     value,
     targetTag: element.tagName.toLowerCase(),
     timestamp: nowTs(),
     pageUrl: window.location.href,
     pageTitle: document.title || null,
     pageName,
-    context: typeof context === "object" ? context : { type: context },
+    context: {
+      ...contextObj,
+      transientUi,
+      dismissiveAction,
+    },
   };
 
   const buttonData = getButtonData(element);
