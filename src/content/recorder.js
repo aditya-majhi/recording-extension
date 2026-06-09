@@ -12,6 +12,9 @@ const pendingInputs = new Map();
 const dropdownValueByControlKey = new Map();
 let lastOpenedDropdownKey = "";
 
+//For page name remembering
+let lastVariablePageName = null;
+
 const CLICK_DEBOUNCE_MS = 300;
 const INPUT_DEBOUNCE_MS = 800;
 const FLUSH_INTERVAL_MS = 2000;
@@ -20,7 +23,7 @@ const FALLBACK_MAX_ANCESTOR_WALK = 6;
 const RECORDER_UI_ATTR = "data-automation-recorder-ui";
 
 const DROPDOWN_CONTROL_SELECTOR =
-  "select, [role='combobox'], [aria-haspopup='listbox'], " +
+  "select, [aria-haspopup='listbox'], " +
   ".ant-select-selector, .react-select__control, [class*='-control'], " +
   ".MuiSelect-select, .ng-select-container";
 
@@ -2047,26 +2050,37 @@ function findLabelText(element) {
 }
 
 function generateVariableName(element, kind) {
+  const sourceEl =
+    kind === "button"
+      ? element.closest(
+          "button, [role='button'], input[type='button'], input[type='submit'], input[type='reset']",
+        ) || element
+      : element;
+
   if (kind === "button") {
-    const buttonData = getButtonData(element);
+    const buttonData = getButtonData(sourceEl);
     const raw =
       buttonData?.text ||
-      element.getAttribute("aria-label") ||
-      element.getAttribute("title") ||
-      element.getAttribute("value") ||
+      buttonData?.ariaLabel ||
+      buttonData?.title ||
+      buttonData?.value ||
+      getDirectTextContent(sourceEl) ||
+      (sourceEl.textContent || "").trim() ||
       "";
+
     const cleaned = raw.replace(/[^a-zA-Z0-9\s]/g, " ").trim();
     const tokens = cleaned.split(/\s+/).filter(Boolean);
+
     if (tokens.length) {
       return `bt_${tokens.join("_")}`.slice(0, 60);
     }
     return "bt_button";
   }
 
-  const label = findLabelText(element);
+  const label = findLabelText(sourceEl);
   const prefix = kind === "output" ? "out" : "in";
 
-  const tableLabel = getTableAwareLabel(element);
+  const tableLabel = getTableAwareLabel(sourceEl);
   if (tableLabel) {
     const cleaned = tableLabel
       .replace(/[^a-zA-Z0-9\s]/g, "")
@@ -2102,8 +2116,8 @@ function generateVariableName(element, kind) {
     }
   }
 
-  const tag = element.tagName.toLowerCase();
-  const type = (element.getAttribute("type") || "").toLowerCase();
+  const tag = sourceEl.tagName.toLowerCase();
+  const type = (sourceEl.getAttribute("type") || "").toLowerCase();
   const fallback = type ? `${tag}_${type}` : tag;
   return `${prefix}_${fallback}`.slice(0, 50);
 }
@@ -2218,20 +2232,31 @@ function buildVariableSavedStep(variable) {
 function normalizeVariableTarget(rawEl) {
   if (!(rawEl instanceof Element)) return null;
 
-  // 1) Narrow first: if clicked element is already a form control, use it.
-  if (isInputElement(rawEl)) {
-    return rawEl;
-  }
+  // Intentionally exclude [role='combobox'] itself so input[role='combobox']
+  // gets mapped to its container instead of returning itself.
+  const DROPDOWN_ROOT_SELECTOR =
+    "select, [aria-haspopup='listbox'], " +
+    ".ant-select, .ant-select-selector, .react-select__control, " +
+    ".MuiSelect-select, .ng-select-container";
 
-  // 2) Narrow down: find an input-like descendant inside the clicked node.
-  const embeddedInput = rawEl.querySelector(
-    "input, textarea, select, [contenteditable='true']",
-  );
-  if (embeddedInput instanceof Element && isInputElement(embeddedInput)) {
-    return embeddedInput;
-  }
+  const toDropdownRoot = (el) => {
+    if (!(el instanceof Element)) return null;
 
-  // 3) Option-like elements -> resolve to owning dropdown control.
+    // If this is the inner combobox input, jump to stable wrapper first.
+    if (
+      el.tagName === "INPUT" &&
+      (el.getAttribute("role") || "").toLowerCase() === "combobox"
+    ) {
+      const wrapper = el.closest(
+        ".react-select__control, .ant-select, .ant-select-selector, .MuiSelect-select, .ng-select-container, [aria-haspopup='listbox']",
+      );
+      if (wrapper) return wrapper;
+    }
+
+    return el.closest(DROPDOWN_ROOT_SELECTOR);
+  };
+
+  // 1) Option/menu item -> owning dropdown control
   const optionLike = rawEl.closest(
     "option, [role='option'], .ant-select-item-option, .MuiMenuItem-root, .mat-option, .react-select__option",
   );
@@ -2240,64 +2265,80 @@ function normalizeVariableTarget(rawEl) {
     if (nativeSelect) return nativeSelect;
 
     const ownerCombobox = document.querySelector(
-      "[role='combobox'][aria-expanded='true'], .ant-select-open [role='combobox'], .react-select__control--menu-is-open, .MuiSelect-select[aria-expanded='true']",
+      "[role='combobox'][aria-expanded='true'], " +
+        ".ant-select-open [role='combobox'], " +
+        ".react-select__control--menu-is-open, " +
+        ".MuiSelect-select[aria-expanded='true']",
     );
-    if (ownerCombobox instanceof Element) return ownerCombobox;
+    if (ownerCombobox instanceof Element) {
+      const root = toDropdownRoot(ownerCombobox);
+      return root || ownerCombobox;
+    }
 
     const nearbyCombobox = optionLike.closest(
       "[role='combobox'], [aria-haspopup='listbox'], .ant-select, .react-select__control, .MuiSelect-select, .ng-select-container",
     );
-    if (nearbyCombobox) return nearbyCombobox;
+    if (nearbyCombobox) {
+      const root = toDropdownRoot(nearbyCombobox);
+      return root || nearbyCombobox;
+    }
   }
 
-  // 4) Selected-value chip/text inside custom dropdown.
+  // 2) Selected chip/value area -> dropdown root
   const selectedValueLike = rawEl.closest(
     ".ant-select-selection-item, .react-select__single-value, .MuiSelect-select, .ng-value-label, [aria-live='polite']",
   );
   if (selectedValueLike) {
-    const container = selectedValueLike.closest(
-      "[role='combobox'], [aria-haspopup='listbox'], .ant-select, .react-select__control, .MuiSelect-select, .ng-select-container",
-    );
-    if (container) return container;
+    const root = toDropdownRoot(selectedValueLike);
+    if (root) return root;
   }
 
-  // 5) Label-wrapped controls.
+  // 3) Any element inside dropdown -> dropdown root
+  const dropdownRoot = toDropdownRoot(rawEl);
+  if (dropdownRoot) return dropdownRoot;
+
+  // 4) Label-wrapped controls
   const label = rawEl.closest("label");
   if (label) {
     const forAttr = label.getAttribute("for");
     if (forAttr) {
       const linked = document.getElementById(forAttr);
-      if (linked && isInputElement(linked)) {
-        return linked;
-      }
+      if (linked && isInputElement(linked)) return linked;
     }
 
     const wrapped = label.querySelector("input, textarea, select");
-    if (wrapped instanceof Element && isInputElement(wrapped)) {
-      return wrapped;
-    }
+    if (wrapped instanceof Element && isInputElement(wrapped)) return wrapped;
   }
 
-  // 6) Generic dropdown wrappers.
-  const dropdownControl = rawEl.closest(
-    "select, [role='combobox'], [aria-haspopup='listbox'], .ant-select-selector, .react-select__control, .MuiSelect-select, .ng-select-container",
-  );
-  if (dropdownControl) return dropdownControl;
+  // 5) Non-dropdown controls
+  if (isInputElement(rawEl)) return rawEl;
 
-  // 7) Custom radio/checkbox wrappers.
+  // 6) Embedded control fallback
+  const embeddedInput = rawEl.querySelector(
+    "input, textarea, select, [contenteditable='true']",
+  );
+  if (embeddedInput instanceof Element && isInputElement(embeddedInput)) {
+    const embeddedDropdownRoot = toDropdownRoot(embeddedInput);
+    if (embeddedDropdownRoot) return embeddedDropdownRoot;
+    return embeddedInput;
+  }
+
+  // 7) Custom radio/checkbox wrappers
   const embeddedRadio = rawEl.querySelector('input[type="radio"]');
   if (embeddedRadio) return embeddedRadio;
 
   const embeddedCheckbox = rawEl.querySelector('input[type="checkbox"]');
   if (embeddedCheckbox) return embeddedCheckbox;
 
-  // 8) Table fallback only as last resort.
+  // 8) Table fallback
   const tableCell = rawEl.closest("td, th");
   if (tableCell) {
     const inputInCell = tableCell.querySelector(
       "input, textarea, select, [contenteditable='true']",
     );
     if (inputInCell instanceof Element && isInputElement(inputInCell)) {
+      const inCellDropdownRoot = toDropdownRoot(inputInCell);
+      if (inCellDropdownRoot) return inCellDropdownRoot;
       return inputInCell;
     }
     return tableCell;
@@ -2312,12 +2353,16 @@ function createVariable(kind) {
 
   const candidateRoots = [
     lastRightClickedElement,
-    document.querySelector("[role='combobox'][aria-expanded='true']"),
-    document.querySelector(".ant-select-focused [role='combobox']"),
+
+    // Prefer stable dropdown controls/wrappers over inner combobox inputs.
     document.querySelector(
-      ".react-select__control--is-focused input[role='combobox']",
+      ".react-select__control--is-focused, .react-select__control--menu-is-open",
     ),
-    document.querySelector(".Mui-focused [role='combobox']"),
+    document.querySelector(".ant-select-focused .ant-select-selector"),
+    document.querySelector(".ant-select-open .ant-select-selector"),
+    document.querySelector(".Mui-focused [aria-haspopup='listbox']"),
+    document.querySelector("[aria-haspopup='listbox'][aria-expanded='true']"),
+
     activeEl,
   ].filter(Boolean);
 
@@ -2416,9 +2461,15 @@ function createVariable(kind) {
   const context = kind === "button" ? { type: "button" } : detectedContext;
 
   const suggestedName = generateVariableName(el, normalizedKind);
-  const clickedSvg =
-    el.tagName.toLowerCase() === "svg" || !!el.querySelector("svg");
-  const defaultPromptValue = clickedSvg ? "" : suggestedName;
+
+  const defaultPromptValue =
+    suggestedName ||
+    (normalizedKind === "button"
+      ? "bt_button"
+      : normalizedKind === "input"
+        ? "in_field"
+        : "out_field");
+
   const userInput = window.prompt("Variable name", defaultPromptValue);
 
   if (userInput === null) return null;
@@ -2439,9 +2490,18 @@ function createVariable(kind) {
   };
 
   const detectedPageName = getPageName() || "Unknown Page";
-  const userPage = window.prompt("Page name", detectedPageName);
+  const pagePromptDefault = lastVariablePageName || detectedPageName;
+  const userPage = window.prompt("Page name", pagePromptDefault);
   if (userPage === null) return null;
-  const finalPageName = userPage.trim() || detectedPageName;
+
+  const typedPageName = userPage.trim();
+  const finalPageName = typedPageName || pagePromptDefault;
+
+  if (typedPageName) {
+    lastVariablePageName = typedPageName;
+  } else if (!lastVariablePageName && finalPageName) {
+    lastVariablePageName = finalPageName;
+  }
 
   let enumValues = null;
   let selectedValue = null;
@@ -3152,6 +3212,7 @@ export function startRecording() {
   variables = [];
   lastClick = { selector: null, time: 0 };
   pendingInputs.clear();
+  lastVariablePageName = null;
 
   currentPageName = detectBestPageName();
   attachRouteObserver();
@@ -3191,6 +3252,7 @@ export async function stopRecording() {
   await sendFlush(true);
 
   clearPendingMeaningfulClick();
+  lastVariablePageName = null;
 
   const result = {
     steps: compressSteps([...steps]),
