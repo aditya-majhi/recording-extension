@@ -2152,6 +2152,19 @@ function createStep(type, element, value = null) {
     /close|dismiss|skip|got it|cancel|not now|x/.test(rawText) ||
     /close|dismiss|skip|cancel|not now/.test(ariaLabel);
 
+  const targetTag = element.tagName.toLowerCase();
+
+  const inferredInputType =
+    targetTag === "input"
+      ? (element.getAttribute("type") || "text").toLowerCase()
+      : targetTag === "textarea"
+        ? "textarea"
+        : targetTag === "select"
+          ? element.multiple
+            ? "select-multiple"
+            : "select-one"
+          : null;
+
   const step = {
     type,
     selector: { css, xpath, relativeXPath },
@@ -2171,7 +2184,8 @@ function createStep(type, element, value = null) {
       candidateCount: selectorCandidates.length,
     },
     value,
-    targetTag: element.tagName.toLowerCase(),
+    targetTag,
+    inputType: inferredInputType,
     timestamp: nowTs(),
     pageUrl: window.location.href,
     pageTitle: document.title || null,
@@ -2180,6 +2194,7 @@ function createStep(type, element, value = null) {
       ...contextObj,
       transientUi,
       dismissiveAction,
+      ...(inferredInputType ? { inputType: inferredInputType } : {}),
     },
   };
 
@@ -2215,6 +2230,7 @@ function buildVariableSavedStep(variable) {
     variableKind: variable.kind,
     variableValue: variable.value ?? null,
     targetTag: variable.targetTag || null,
+    inputType: variable.inputType || null,
     timestamp: nowTs(),
     pageUrl: variable.pageUrl || window.location.href,
     pageTitle: variable.pageTitle || document.title || null,
@@ -2223,8 +2239,14 @@ function buildVariableSavedStep(variable) {
       variable.kind === "button"
         ? { type: "button" }
         : typeof variable.context === "object"
-          ? variable.context
-          : { type: variable.context || "formField" },
+          ? {
+              ...variable.context,
+              ...(variable.inputType ? { inputType: variable.inputType } : {}),
+            }
+          : {
+              type: variable.context || "formField",
+              ...(variable.inputType ? { inputType: variable.inputType } : {}),
+            },
   };
 }
 
