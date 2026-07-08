@@ -1070,6 +1070,18 @@ function isStableId(value) {
   const v = String(value).trim();
   if (!v) return false;
 
+  // Reject React/MUI runtime ids like :r9:, :r12:, :R3:
+  if (/^:r[0-9a-z]+:$/i.test(v)) return false;
+
+  // Reject ids that contain runtime React/MUI tokens inside a larger id
+  if (/:r[0-9a-z]+:/i.test(v)) return false;
+
+  // Reject portal-wrapped runtime ids like portal/:r9:
+  if (/portal\/:r[0-9a-z]+:/i.test(v)) return false;
+
+  // Reject generic colon-delimited runtime ids
+  if (/^:[a-z0-9_-]+:$/i.test(v)) return false;
+
   // Dynamic libraries / generated ids
   if (/^(react-select|headlessui|radix|mui|ant|chakra)-/i.test(v)) return false;
 
@@ -1107,6 +1119,41 @@ function isStableClassName(className) {
     return false;
 
   return true;
+}
+
+function getDialogScopedButtonXPath(element) {
+  if (!(element instanceof Element)) return null;
+
+  const isButtonLike =
+    element.tagName === "BUTTON" || element.getAttribute("role") === "button";
+
+  if (!isButtonLike) return null;
+
+  const dialog = element.closest(
+    '[role="dialog"], [aria-modal="true"], .modal, .MuiDialog-root, .ant-modal',
+  );
+  if (!dialog) return null;
+
+  const text = normalizeSpaceText(
+    getDirectTextContent(element) || element.textContent || "",
+  );
+  if (!text || text.length > 80) return null;
+
+  const buttonExpr = `//*[self::button or @role="button"][normalize-space(.)=${toXPathLiteral(text)}]`;
+
+  if (isStableId(dialog.id)) {
+    return `//*[@id=${toXPathLiteral(dialog.id)}]${buttonExpr}`;
+  }
+
+  if (dialog.getAttribute("role") === "dialog") {
+    return `//*[@role="dialog"]${buttonExpr}`;
+  }
+
+  if (dialog.getAttribute("aria-modal") === "true") {
+    return `//*[@aria-modal="true"]${buttonExpr}`;
+  }
+
+  return `//div[@role="dialog"]${buttonExpr}`;
 }
 
 function buildOverlayScopedXPath(element) {
@@ -1245,11 +1292,23 @@ function getRelativeXPath(element) {
     }
   }
 
-  if (element.tagName === "BUTTON" || element.tagName === "A") {
+  if (
+    element.tagName === "BUTTON" ||
+    element.getAttribute("role") === "button"
+  ) {
+    const dialogScoped = getDialogScopedButtonXPath(element);
+    if (dialogScoped) return dialogScoped;
+
     const text = normalizeSpaceText(getDirectTextContent(element));
     if (text && text.length < 80) {
-      const tag = element.tagName.toLowerCase();
-      return `//${tag}[normalize-space(.)=${toXPathLiteral(text)}]`;
+      return `//button[normalize-space(.)=${toXPathLiteral(text)}]`;
+    }
+  }
+
+  if (element.tagName === "A") {
+    const text = normalizeSpaceText(getDirectTextContent(element));
+    if (text && text.length < 80) {
+      return `//a[normalize-space(.)=${toXPathLiteral(text)}]`;
     }
   }
 
@@ -1365,12 +1424,34 @@ function buildSelectorCandidates(element) {
   const text = normalizeSpaceText(
     getDirectTextContent(element) || element.textContent || "",
   );
+
+  const dialogScoped = getDialogScopedButtonXPath(element);
+  if (dialogScoped) {
+    add("relativeXPath", dialogScoped, 96);
+  }
+
   if (text && text.length <= 80) {
-    add(
-      "text",
-      `//${element.tagName.toLowerCase()}[normalize-space(.)=${toXPathLiteral(text)}]`,
-      82,
-    );
+    if (
+      element.tagName === "BUTTON" ||
+      element.getAttribute("role") === "button"
+    ) {
+      add(
+        "relativeXPath",
+        `//button[normalize-space(.)=${toXPathLiteral(text)}]`,
+        78,
+      );
+      add(
+        "xpath",
+        `//*[@role="button" and normalize-space(.)=${toXPathLiteral(text)}]`,
+        74,
+      );
+    } else if (element.tagName === "A") {
+      add(
+        "relativeXPath",
+        `//a[normalize-space(.)=${toXPathLiteral(text)}]`,
+        72,
+      );
+    }
   }
 
   const relativeXPath = getRelativeXPath(element);
@@ -2123,6 +2204,171 @@ function generateVariableName(element, kind) {
 }
 
 // ── Step & Variable Creation ──────────────────────────────────────────────────
+function deriveControlMeta(element) {
+  var fallback = {
+    targetTag: null,
+    inputType: null,
+    captureMode: "unknown",
+    roleHint: null,
+    isMultiSelect: false,
+  };
+
+  if (!(element instanceof Element)) return fallback;
+
+  var tag = String(element.tagName || "").toLowerCase();
+  var role = String(element.getAttribute("role") || "").toLowerCase();
+  var ariaHasPopup = String(
+    element.getAttribute("aria-haspopup") || "",
+  ).toLowerCase();
+  var isContentEditable = element.getAttribute("contenteditable") === "true";
+
+  if (tag === "input") {
+    var rawType = String(element.getAttribute("type") || "text").toLowerCase();
+
+    if (rawType === "checkbox") {
+      return {
+        targetTag: "input",
+        inputType: "checkbox",
+        captureMode: "checkbox",
+        roleHint: role || null,
+        isMultiSelect: false,
+      };
+    }
+
+    if (rawType === "radio") {
+      return {
+        targetTag: "input",
+        inputType: "radio",
+        captureMode: "radio",
+        roleHint: role || null,
+        isMultiSelect: false,
+      };
+    }
+
+    if (rawType === "file") {
+      return {
+        targetTag: "input",
+        inputType: "file",
+        captureMode: "file",
+        roleHint: role || null,
+        isMultiSelect: false,
+      };
+    }
+
+    if (
+      rawType === "date" ||
+      rawType === "time" ||
+      rawType === "datetime-local" ||
+      rawType === "month" ||
+      rawType === "week"
+    ) {
+      return {
+        targetTag: "input",
+        inputType: rawType,
+        captureMode: "date-like",
+        roleHint: role || null,
+        isMultiSelect: false,
+      };
+    }
+
+    if (rawType === "number" || rawType === "range") {
+      return {
+        targetTag: "input",
+        inputType: rawType,
+        captureMode: "number",
+        roleHint: role || null,
+        isMultiSelect: false,
+      };
+    }
+
+    if (rawType === "color") {
+      return {
+        targetTag: "input",
+        inputType: "color",
+        captureMode: "color",
+        roleHint: role || null,
+        isMultiSelect: false,
+      };
+    }
+
+    return {
+      targetTag: "input",
+      inputType: rawType || "text",
+      captureMode: "text-input",
+      roleHint: role || null,
+      isMultiSelect: false,
+    };
+  }
+
+  if (tag === "textarea") {
+    return {
+      targetTag: "textarea",
+      inputType: "textarea",
+      captureMode: "textarea",
+      roleHint: role || null,
+      isMultiSelect: false,
+    };
+  }
+
+  if (tag === "select") {
+    var isMulti = !!element.multiple;
+    return {
+      targetTag: "select",
+      inputType: isMulti ? "select-multiple" : "select-one",
+      captureMode: isMulti ? "select-multiple" : "select-one",
+      roleHint: role || null,
+      isMultiSelect: isMulti,
+    };
+  }
+
+  if (isContentEditable) {
+    return {
+      targetTag: tag || "div",
+      inputType: "contenteditable",
+      captureMode: "contenteditable",
+      roleHint: role || null,
+      isMultiSelect: false,
+    };
+  }
+
+  if (
+    role === "combobox" ||
+    role === "listbox" ||
+    ariaHasPopup === "listbox" ||
+    element.matches("[aria-haspopup='listbox']")
+  ) {
+    return {
+      targetTag: tag || "div",
+      inputType: "combobox",
+      captureMode: "custom-combobox",
+      roleHint: role || "combobox",
+      isMultiSelect: false,
+    };
+  }
+
+  return {
+    targetTag: tag || null,
+    inputType: null,
+    captureMode: "unknown",
+    roleHint: role || null,
+    isMultiSelect: false,
+  };
+}
+
+function mergeContextWithCaptureMeta(baseContext, meta) {
+  var src =
+    baseContext && typeof baseContext === "object"
+      ? { ...baseContext }
+      : { type: baseContext || "formField" };
+
+  if (meta && meta.inputType) src.inputType = meta.inputType;
+  if (meta && meta.targetTag) src.targetTag = meta.targetTag;
+  if (meta && meta.captureMode) src.captureMode = meta.captureMode;
+  if (meta && meta.roleHint) src.roleHint = meta.roleHint;
+
+  return src;
+}
+
 function createStep(type, element, value = null) {
   if (!element) return null;
 
@@ -2152,23 +2398,16 @@ function createStep(type, element, value = null) {
     /close|dismiss|skip|got it|cancel|not now|x/.test(rawText) ||
     /close|dismiss|skip|cancel|not now/.test(ariaLabel);
 
-  const targetTag = element.tagName.toLowerCase();
-
-  const inferredInputType =
-    targetTag === "input"
-      ? (element.getAttribute("type") || "text").toLowerCase()
-      : targetTag === "textarea"
-        ? "textarea"
-        : targetTag === "select"
-          ? element.multiple
-            ? "select-multiple"
-            : "select-one"
-          : null;
+  const controlMeta = deriveControlMeta(element);
+  const targetTag = controlMeta.targetTag;
+  const inferredInputType = controlMeta.inputType;
+  const inferredCaptureMode = controlMeta.captureMode;
 
   const step = {
     type,
     selector: { css, xpath, relativeXPath },
     selectorCandidates,
+    captureMode: inferredCaptureMode,
     selectorMeta: {
       primary:
         selectorCandidates[0]?.value || relativeXPath || css || xpath || null,
@@ -2191,10 +2430,9 @@ function createStep(type, element, value = null) {
     pageTitle: document.title || null,
     pageName,
     context: {
-      ...contextObj,
+      ...mergeContextWithCaptureMeta(contextObj, controlMeta),
       transientUi,
       dismissiveAction,
-      ...(inferredInputType ? { inputType: inferredInputType } : {}),
     },
   };
 
@@ -2222,6 +2460,19 @@ function getDirectTextContent(el) {
 }
 
 function buildVariableSavedStep(variable) {
+  const meta = {
+    targetTag: variable.targetTag || null,
+    inputType: variable.inputType || null,
+    captureMode: variable.captureMode || "unknown",
+    roleHint:
+      variable.context && typeof variable.context === "object"
+        ? variable.context.roleHint || null
+        : null,
+  };
+
+  const baseContext =
+    variable.kind === "button" ? { type: "button" } : variable.context;
+
   return {
     type: "store_variable",
     selector: variable.selector || null,
@@ -2229,24 +2480,14 @@ function buildVariableSavedStep(variable) {
     variableName: variable.name,
     variableKind: variable.kind,
     variableValue: variable.value ?? null,
-    targetTag: variable.targetTag || null,
-    inputType: variable.inputType || null,
+    targetTag: meta.targetTag,
+    inputType: meta.inputType,
+    captureMode: meta.captureMode,
     timestamp: nowTs(),
     pageUrl: variable.pageUrl || window.location.href,
     pageTitle: variable.pageTitle || document.title || null,
     pageName: variable.pageName || getPageName(),
-    context:
-      variable.kind === "button"
-        ? { type: "button" }
-        : typeof variable.context === "object"
-          ? {
-              ...variable.context,
-              ...(variable.inputType ? { inputType: variable.inputType } : {}),
-            }
-          : {
-              type: variable.context || "formField",
-              ...(variable.inputType ? { inputType: variable.inputType } : {}),
-            },
+    context: mergeContextWithCaptureMeta(baseContext, meta),
   };
 }
 
@@ -2425,10 +2666,11 @@ function createVariable(kind) {
   const { css, xpath, relativeXPath } = buildSelectors(el);
   if (!css && !xpath && !relativeXPath) return null;
 
-  const inputType = (el.getAttribute("type") || "").toLowerCase();
-  const isRadioOrCheckbox =
-    el.tagName === "INPUT" &&
-    (inputType === "radio" || inputType === "checkbox");
+  const controlMeta = deriveControlMeta(el);
+  const targetTag = controlMeta.targetTag;
+  const inputType = controlMeta.inputType || "";
+  const captureMode = controlMeta.captureMode || "unknown";
+  const isRadioOrCheckbox = inputType === "radio" || inputType === "checkbox";
 
   // Important: only treat as button metadata when user explicitly chose button
   const buttonData = normalizedKind === "button" ? getButtonData(el) : null;
@@ -2480,7 +2722,8 @@ function createVariable(kind) {
 
   const dataType = detectDataType(el);
   const detectedContext = detectVariableContext(el);
-  const context = kind === "button" ? { type: "button" } : detectedContext;
+  const contextBase = kind === "button" ? { type: "button" } : detectedContext;
+  const context = mergeContextWithCaptureMeta(contextBase, controlMeta);
 
   const suggestedName = generateVariableName(el, normalizedKind);
 
@@ -2584,8 +2827,9 @@ function createVariable(kind) {
     selectedValues,
     isMultiSelect,
     capture,
-    targetTag: el.tagName.toLowerCase(),
-    inputType: el.getAttribute("type") || null,
+    targetTag: targetTag || null,
+    inputType: inputType || null,
+    captureMode: captureMode,
     pageUrl: window.location.href,
     pageTitle: document.title || null,
     pageName: finalPageName,
@@ -2610,7 +2854,11 @@ function createVariable(kind) {
   }
 
   if (isButtonVariable && buttonData) {
-    variable.context = { type: "button" };
+    variable.context = mergeContextWithCaptureMeta(
+      { type: "button" },
+      { ...controlMeta, captureMode: "button-text" },
+    );
+    variable.captureMode = "button-text";
     variable.isButtonElement = true;
     variable.buttonData = buttonData;
     variable.dataType = "button";
