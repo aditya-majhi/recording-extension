@@ -198,7 +198,14 @@ function commitPendingMeaningfulClick(reason) {
         : pendingMeaningfulClick.step.context,
   };
 
-  steps.push(step);
+  const insertAt =
+    Number.isInteger(pendingMeaningfulClick.insertAt) &&
+    pendingMeaningfulClick.insertAt >= 0
+      ? Math.min(pendingMeaningfulClick.insertAt, steps.length)
+      : steps.length;
+
+  steps.splice(insertAt, 0, step);
+
   lastClick = {
     selector: pendingMeaningfulClick.selectorKey,
     time: nowTs(),
@@ -219,6 +226,7 @@ function armMeaningfulClickCommit(step, selectorKey) {
     selectorKey,
     startedAt: nowTs(),
     before: getUiTransitionSnapshot(),
+    insertAt: steps.length,
   };
 
   pendingMeaningfulClickObserver = new MutationObserver(() => {
@@ -2009,6 +2017,14 @@ function resolveFallbackMeaningfulTarget(rawEl) {
   return null;
 }
 
+//Helper for dialogs
+function isDialogScopedActionTarget(el) {
+  if (!(el instanceof Element)) return false;
+  return !!el.closest(
+    "[role='dialog'], [aria-modal='true'], .modal, .MuiDialog-root, .ant-modal, #save-approval-wrapper",
+  );
+}
+
 //Helpers
 function normalizeLabelText(text) {
   if (!text) return null;
@@ -3329,6 +3345,14 @@ function handleClick(event) {
     isDropdownControlElement(target);
 
   if (isDropdownOpenClick) {
+    steps.push(step);
+    lastClick = { selector: css, time: now };
+    drainPendingInputs();
+    sendFlush(false);
+    return;
+  }
+
+  if (stepType === "click" && isDialogScopedActionTarget(target)) {
     steps.push(step);
     lastClick = { selector: css, time: now };
     drainPendingInputs();
