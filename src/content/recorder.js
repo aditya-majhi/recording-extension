@@ -398,6 +398,15 @@ function getXPath(element) {
   return segs.length ? "/" + segs.join("/") : null;
 }
 
+function trimXPathAfterButton(xpath) {
+  if (!xpath || typeof xpath !== "string") return xpath;
+
+  const trimmed = xpath.match(/^(.*?\/button(?:\[\d+\])?)(?:\/.*)?$/i);
+  if (trimmed?.[1]) return trimmed[1];
+
+  return xpath;
+}
+
 function detectDataType(element) {
   if (!(element instanceof Element)) return "string";
 
@@ -1147,21 +1156,21 @@ function getDialogScopedButtonXPath(element) {
   );
   if (!text || text.length > 80) return null;
 
-  const buttonExpr = `//*[self::button or @role="button"][normalize-space(.)=${toXPathLiteral(text)}]`;
+  const buttonExpr = `//*[self::button or @role="button"][contains(normalize-space(.), ${toXPathLiteral(text)})]`;
 
   if (isStableId(dialog.id)) {
-    return `//*[@id=${toXPathLiteral(dialog.id)}]${buttonExpr}`;
+    return `//*[@id=${toXPathLiteral(dialog.id)} and not(@hidden)]${buttonExpr}`;
   }
 
   if (dialog.getAttribute("role") === "dialog") {
-    return `//*[@role="dialog"]${buttonExpr}`;
+    return `//*[@role="dialog" and not(@hidden)]${buttonExpr}`;
   }
 
   if (dialog.getAttribute("aria-modal") === "true") {
-    return `//*[@aria-modal="true"]${buttonExpr}`;
+    return `//*[@aria-modal="true" and not(@hidden)]${buttonExpr}`;
   }
 
-  return `//div[@role="dialog"]${buttonExpr}`;
+  return `//div[@role="dialog" and not(@hidden)]${buttonExpr}`;
 }
 
 function buildOverlayScopedXPath(element) {
@@ -1309,7 +1318,7 @@ function getRelativeXPath(element) {
 
     const text = normalizeSpaceText(getDirectTextContent(element));
     if (text && text.length < 80) {
-      return `//button[normalize-space(.)=${toXPathLiteral(text)}]`;
+      return `//button[contains(normalize-space(.), ${toXPathLiteral(text)})]`;
     }
   }
 
@@ -1445,13 +1454,24 @@ function buildSelectorCandidates(element) {
     ) {
       add(
         "relativeXPath",
+        `//button[contains(normalize-space(.), ${toXPathLiteral(text)})]`,
+        79,
+      );
+      add(
+        "xpath",
+        `//*[@role="button" and contains(normalize-space(.), ${toXPathLiteral(text)})]`,
+        75,
+      );
+
+      add(
+        "relativeXPath",
         `//button[normalize-space(.)=${toXPathLiteral(text)}]`,
-        78,
+        73,
       );
       add(
         "xpath",
         `//*[@role="button" and normalize-space(.)=${toXPathLiteral(text)}]`,
-        74,
+        70,
       );
     } else if (element.tagName === "A") {
       add(
@@ -2388,8 +2408,38 @@ function mergeContextWithCaptureMeta(baseContext, meta) {
 function createStep(type, element, value = null) {
   if (!element) return null;
 
-  const { css, xpath, relativeXPath } = buildSelectors(element);
-  const selectorCandidates = buildSelectorCandidates(element);
+  let { css, xpath, relativeXPath } = buildSelectors(element);
+  let selectorCandidates = buildSelectorCandidates(element);
+
+  const shouldTrimButtonChildPath =
+    type === "click" &&
+    (/\/button(?:\[\d+\])?\//i.test(String(xpath || "")) ||
+      /\/button(?:\[\d+\])?\//i.test(String(relativeXPath || "")) ||
+      selectorCandidates.some(
+        (candidate) =>
+          candidate &&
+          typeof candidate.value === "string" &&
+          /\/button(?:\[\d+\])?\//i.test(candidate.value),
+      ));
+
+  if (shouldTrimButtonChildPath) {
+    xpath = trimXPathAfterButton(xpath);
+    relativeXPath = trimXPathAfterButton(relativeXPath);
+
+    selectorCandidates = selectorCandidates.map((candidate) => {
+      if (
+        candidate &&
+        typeof candidate.value === "string" &&
+        (candidate.kind === "xpath" || candidate.kind === "relativeXPath")
+      ) {
+        return {
+          ...candidate,
+          value: trimXPathAfterButton(candidate.value),
+        };
+      }
+      return candidate;
+    });
+  }
 
   if (!css && !xpath && !relativeXPath && selectorCandidates.length === 0) {
     return null;
@@ -2454,11 +2504,7 @@ function createStep(type, element, value = null) {
 
   const buttonData = getButtonData(element);
   if (buttonData) {
-    step.buttonValue =
-      buttonData.text ||
-      buttonData.value ||
-      getDirectTextContent(element) ||
-      null;
+    step.buttonData = buttonData;
   }
 
   return step;
