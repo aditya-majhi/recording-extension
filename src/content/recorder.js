@@ -43,6 +43,162 @@ let pendingSubmitLikeClick = null;
 let pendingSubmitLikeClickTimerId = null;
 const SUBMIT_RECONCILE_MS = 220;
 
+const RECORDER_STORAGE_KEY = "automation_recorder_session_v1";
+const RECORDER_SESSION_MAX_AGE_MS = 4 * 60 * 60 * 1000; // 4 hours
+
+let restoredSessionReady = false;
+let persistTimerId = null;
+
+function safeStorageSet(obj) {
+  try {
+    if (!chrome?.storage?.local) return;
+    chrome.storage.local.set(obj, () => {
+      // ignore storage errors to avoid breaking recording
+    });
+  } catch {
+    // ignore
+  }
+}
+
+function safeStorageGet(key, cb) {
+  try {
+    if (!chrome?.storage?.local) {
+      cb(null);
+      return;
+    }
+    chrome.storage.local.get([key], (res) => cb(res?.[key] || null));
+  } catch {
+    cb(null);
+  }
+}
+
+function safeStorageRemove(key) {
+  try {
+    if (!chrome?.storage?.local) return;
+    chrome.storage.local.remove([key], () => {
+      // ignore
+    });
+  } catch {
+    // ignore
+  }
+}
+
+function serializeMap(mapObj) {
+  try {
+    return Array.from(mapObj.entries());
+  } catch {
+    return [];
+  }
+}
+
+function hydrateMap(mapObj, entries) {
+  try {
+    mapObj.clear();
+    if (!Array.isArray(entries)) return;
+    for (const item of entries) {
+      if (!Array.isArray(item) || item.length < 2) continue;
+      const key = String(item[0] || "");
+      const val = item[1];
+      if (!key) continue;
+      mapObj.set(key, val);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function persistRecorderSession(reason) {
+  const snapshot = {
+    version: 1,
+    reason: String(reason || ""),
+    savedAt: nowTs(),
+    origin: window.location.origin,
+    href: window.location.href,
+    isRecording: Boolean(isRecording),
+    steps: Array.isArray(steps) ? [...steps] : [],
+    variables: Array.isArray(variables) ? [...variables] : [],
+    lastClick:
+      lastClick && typeof lastClick === "object"
+        ? {
+            selector: lastClick.selector || null,
+            time: Number(lastClick.time || 0),
+          }
+        : { selector: null, time: 0 },
+    lastVariablePageName: lastVariablePageName || null,
+    currentPageName: currentPageName || null,
+    lastOpenedDropdownKey: lastOpenedDropdownKey || "",
+    dropdownEntries: serializeMap(dropdownValueByControlKey),
+  };
+
+  safeStorageSet({ [RECORDER_STORAGE_KEY]: snapshot });
+}
+
+function schedulePersistRecorderSession(reason) {
+  if (persistTimerId) {
+    clearTimeout(persistTimerId);
+  }
+  persistTimerId = setTimeout(() => {
+    persistTimerId = null;
+    persistRecorderSession(reason);
+  }, 120);
+}
+
+function clearPersistedRecorderSession() {
+  restoredSessionReady = false;
+  safeStorageRemove(RECORDER_STORAGE_KEY);
+}
+
+function tryRestoreRecorderSession() {
+  safeStorageGet(RECORDER_STORAGE_KEY, (snap) => {
+    if (!snap || typeof snap !== "object") return;
+
+    const isFresh =
+      Number.isFinite(Number(snap.savedAt)) &&
+      nowTs() - Number(snap.savedAt) <= RECORDER_SESSION_MAX_AGE_MS;
+
+    const sameOrigin =
+      String(snap.origin || "") === String(window.location.origin || "");
+    const wasRecording = Boolean(snap.isRecording);
+
+    if (!isFresh || !sameOrigin || !wasRecording) return;
+
+    if (!Array.isArray(snap.steps)) return;
+
+    steps = [...snap.steps];
+    variables = Array.isArray(snap.variables) ? [...snap.variables] : [];
+    lastClick =
+      snap.lastClick && typeof snap.lastClick === "object"
+        ? {
+            selector: snap.lastClick.selector || null,
+            time: Number(snap.lastClick.time || 0),
+          }
+        : { selector: null, time: 0 };
+
+    lastVariablePageName =
+      typeof snap.lastVariablePageName === "string"
+        ? snap.lastVariablePageName
+        : null;
+
+    currentPageName =
+      typeof snap.currentPageName === "string" && snap.currentPageName
+        ? snap.currentPageName
+        : detectBestPageName();
+
+    lastOpenedDropdownKey = String(snap.lastOpenedDropdownKey || "");
+    hydrateMap(dropdownValueByControlKey, snap.dropdownEntries);
+
+    // Important: do not mark isRecording=true here yet.
+    // We only mark that restored data is available, and startRecording will resume.
+    restoredSessionReady = true;
+
+    dbg("session:restored", {
+      steps: steps.length,
+      variables: variables.length,
+      restoredSessionReady,
+    });
+  });
+}
+
 function clearPendingSubmitLikeClick() {
   pendingSubmitLikeClick = null;
   if (pendingSubmitLikeClickTimerId) {
@@ -2992,6 +3148,7 @@ function compressSteps(allSteps) {
 function sendFlush(isFinal) {
   const compressed = compressSteps([...steps]);
   const vars = [...variables];
+  schedulePersistRecorderSession(isFinal ? "flush-final" : "flush");
 
   dbg("flush:outgoing", {
     isFinal,
@@ -3542,17 +3699,29 @@ function handleSubmit(event) {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+tryRestoreRecorderSession();
+
 export function startRecording() {
   clearPendingMeaningfulClick();
   clearPendingSubmitLikeClick();
   lastPointerDownDropdownOpen = { key: "", time: 0, consumed: false };
+
   if (isRecording) return;
   isRecording = true;
-  steps = [];
-  variables = [];
-  lastClick = { selector: null, time: 0 };
-  pendingInputs.clear();
-  lastVariablePageName = null;
+
+  // If we restored an active session after refresh, resume it.
+  // Otherwise start a fresh session as before.
+  if (!restoredSessionReady) {
+    steps = [];
+    variables = [];
+    lastClick = { selector: null, time: 0 };
+    pendingInputs.clear();
+    lastVariablePageName = null;
+    lastOpenedDropdownKey = "";
+    dropdownValueByControlKey.clear();
+  } else {
+    restoredSessionReady = false;
+  }
 
   currentPageName = detectBestPageName();
   attachRouteObserver();
@@ -3571,12 +3740,15 @@ export function startRecording() {
   if (!flushIntervalId) {
     flushIntervalId = window.setInterval(periodicFlush, FLUSH_INTERVAL_MS);
   }
+
+  schedulePersistRecorderSession("start-recording");
 }
 
 export async function stopRecording() {
   if (!isRecording) {
     return { steps: [], variables: [] };
   }
+
   commitPendingSubmitLikeClick("stop-recording");
 
   isRecording = false;
@@ -3601,6 +3773,10 @@ export async function stopRecording() {
 
   steps = [];
   variables = [];
+  lastOpenedDropdownKey = "";
+  dropdownValueByControlKey.clear();
+
+  clearPersistedRecorderSession();
 
   return result;
 }
@@ -3622,5 +3798,7 @@ export function handleCreateVariable(kind) {
     }
 
     console.log("[RECORDER] variable added:", variable.name);
+
+    schedulePersistRecorderSession("variable-created");
   }
 }
