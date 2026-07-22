@@ -36,8 +36,12 @@ let pendingMeaningfulClickPollId = null;
 let pendingMeaningfulClickObserver = null;
 let lastPointerDownDropdownOpen = { key: "", time: 0, consumed: false };
 
-const MEANINGFUL_CLICK_WINDOW_MS = 1400;
+const MEANINGFUL_CLICK_WINDOW_MS = 2200;
 const MEANINGFUL_CLICK_POLL_MS = 120;
+
+// Mitigations
+const CLICK_THEN_INPUT_SUPPRESS_MS = 650;
+const ACTIONABLE_INPUT_MIN_FALLBACK_SCORE = 4;
 
 let pendingSubmitLikeClick = null;
 let pendingSubmitLikeClickTimerId = null;
@@ -1559,6 +1563,43 @@ function buildSelectorCandidates(element) {
     out.push({ kind, value: v, confidence });
   };
 
+  const tagName = element.tagName.toLowerCase();
+  const text = normalizeSpaceText(
+    getDirectTextContent(element) || element.textContent || "",
+  );
+
+  // --- Requested locator kinds ---
+  // ID
+  if (isStableId(element.id)) {
+    add("id", element.id, 92);
+  }
+
+  // Name
+  const name = element.getAttribute("name");
+  if (name && !/\d{5,}/.test(name)) {
+    add("name", name, 88);
+  }
+
+  // ClassName
+  const stableClasses =
+    element.classList && element.classList.length
+      ? Array.from(element.classList).filter(isStableClassName)
+      : [];
+  if (stableClasses.length) {
+    add("className", stableClasses.join(" "), 62);
+  }
+
+  // TagName
+  add("tagName", tagName, 35);
+
+  // LinkText / PartialLinkText
+  if (tagName === "a" && text) {
+    add("linkText", text, 78);
+    const partial = text.length > 32 ? text.slice(0, 32) : text;
+    add("partialLinkText", partial, 70);
+  }
+
+  // --- Existing higher quality strategies (kept) ---
   const testId =
     element.getAttribute("data-testid") ||
     element.getAttribute("data-test") ||
@@ -1572,7 +1613,7 @@ function buildSelectorCandidates(element) {
   }
 
   if (isStableId(element.id)) {
-    add("id", `//*[@id=${toXPathLiteral(element.id)}]`, 95);
+    add("id_xpath", `//*[@id=${toXPathLiteral(element.id)}]`, 95);
   }
 
   const role = element.getAttribute("role");
@@ -1585,23 +1626,12 @@ function buildSelectorCandidates(element) {
     );
   }
 
-  const name = element.getAttribute("name");
   if (name && !/\d{5,}/.test(name)) {
-    add(
-      "name",
-      `//${element.tagName.toLowerCase()}[@name=${toXPathLiteral(name)}]`,
-      88,
-    );
+    add("name_xpath", `//${tagName}[@name=${toXPathLiteral(name)}]`, 89);
   }
-
-  const text = normalizeSpaceText(
-    getDirectTextContent(element) || element.textContent || "",
-  );
 
   const dialogScoped = getDialogScopedButtonXPath(element);
-  if (dialogScoped) {
-    add("relativeXPath", dialogScoped, 96);
-  }
+  if (dialogScoped) add("relativeXPath", dialogScoped, 96);
 
   if (text && text.length <= 80) {
     if (
@@ -1618,7 +1648,6 @@ function buildSelectorCandidates(element) {
         `//*[@role="button" and contains(normalize-space(.), ${toXPathLiteral(text)})]`,
         75,
       );
-
       add(
         "relativeXPath",
         `//button[normalize-space(.)=${toXPathLiteral(text)}]`,
@@ -1647,11 +1676,12 @@ function buildSelectorCandidates(element) {
   const xpath = getXPath(element);
   if (xpath) add("xpath", xpath, 60);
 
-  // Deduplicate by value, keep highest confidence
+  // Deduplicate by kind+value (not only value) so multiple kinds are preserved
   const dedup = new Map();
   for (const item of out) {
-    const prev = dedup.get(item.value);
-    if (!prev || item.confidence > prev.confidence) dedup.set(item.value, item);
+    const key = item.kind + "::" + item.value;
+    const prev = dedup.get(key);
+    if (!prev || item.confidence > prev.confidence) dedup.set(key, item);
   }
 
   return Array.from(dedup.values()).sort((a, b) => b.confidence - a.confidence);
@@ -1918,17 +1948,94 @@ function isInputElement(el) {
   return false;
 }
 
+function hasActionLikeRole(role) {
+  return (
+    role === "button" ||
+    role === "link" ||
+    role === "menuitem" ||
+    role === "tab" ||
+    role === "option" ||
+    role === "checkbox" ||
+    role === "radio" ||
+    role === "combobox"
+  );
+}
+
+function hasActionLikeHints(el) {
+  if (!(el instanceof Element)) return false;
+
+  return (
+    el.hasAttribute("onclick") ||
+    el.hasAttribute("aria-controls") ||
+    el.hasAttribute("aria-expanded") ||
+    el.hasAttribute("aria-haspopup") ||
+    el.hasAttribute("data-action") ||
+    el.hasAttribute("data-testid") ||
+    el.hasAttribute("data-qa") ||
+    el.hasAttribute("data-bs-toggle") ||
+    el.hasAttribute("data-toggle")
+  );
+}
+
+function hasPointerCursor(el) {
+  try {
+    return window.getComputedStyle(el).cursor === "pointer";
+  } catch {
+    return false;
+  }
+}
+
+function isActionLikeElement(el) {
+  if (!(el instanceof Element)) return false;
+
+  const tag = el.tagName;
+  const role = (el.getAttribute("role") || "").toLowerCase();
+  const className =
+    typeof el.className === "string" ? el.className.toLowerCase() : "";
+  const text = (getDirectTextContent(el) || "").trim();
+
+  if (hasActionLikeRole(role)) return true;
+  if (hasActionLikeHints(el)) return true;
+
+  if (tag === "INPUT") {
+    const type = (el.getAttribute("type") || "text").toLowerCase();
+
+    if (type === "hidden") return false;
+    if (CLICKABLE_INPUT_TYPES.has(type)) return true;
+    if (type === "checkbox" || type === "radio") return true;
+
+    const readOnlyLike =
+      el.hasAttribute("readonly") ||
+      (typeof el.readOnly === "boolean" && el.readOnly === true);
+
+    const looksLikePicker =
+      /select|dropdown|picker|date|calendar|trigger|toggle|combobox/.test(
+        className,
+      ) ||
+      el.getAttribute("aria-haspopup") === "listbox" ||
+      role === "combobox";
+
+    if (readOnlyLike && (looksLikePicker || hasActionLikeHints(el)))
+      return true;
+  }
+
+  const hasVisualCue = !!text || !!el.querySelector("svg, img, i");
+  if (hasPointerCursor(el) && hasVisualCue) return true;
+
+  return false;
+}
+
 function resolveClickTarget(rawEl) {
   if (!(rawEl instanceof Element)) return null;
 
   if (rawEl.tagName === "INPUT") {
     const type = (rawEl.getAttribute("type") || "text").toLowerCase();
-    if (type === "radio" || type === "checkbox") {
-      return rawEl;
-    }
+    if (type === "radio" || type === "checkbox") return rawEl;
   }
 
-  if (isInputElement(rawEl)) {
+  // Previously all input-like elements were dropped.
+  // Now allow action-like input controls.
+  if (isInputElement(rawEl) && !isActionLikeElement(rawEl)) {
     return null;
   }
 
@@ -1966,28 +2073,24 @@ function resolveClickTarget(rawEl) {
         className,
       );
 
-    const hasPointerCursor = (() => {
-      try {
-        return window.getComputedStyle(el).cursor === "pointer";
-      } catch {
-        return false;
-      }
-    })();
-
+    const pointer = hasPointerCursor(el);
     const hasVisualClickSignal =
       !!getDirectTextContent(el) || !!el.querySelector("svg, img");
 
     if (tag === "BUTTON") return el;
-
     if (tag === "A" && (el.hasAttribute("href") || role)) return el;
 
     if (tag === "INPUT") {
       const type = (el.getAttribute("type") || "text").toLowerCase();
       if (CLICKABLE_INPUT_TYPES.has(type)) return el;
+      if (isActionLikeElement(el)) return el;
       return null;
     }
 
-    if (tag === "TEXTAREA" || tag === "SELECT") return null;
+    if (tag === "TEXTAREA" || tag === "SELECT") {
+      if (isActionLikeElement(el)) return el;
+      return null;
+    }
 
     if (tag === "LABEL") {
       const forAttr = el.getAttribute("for");
@@ -1997,9 +2100,8 @@ function resolveClickTarget(rawEl) {
           const inputType = (
             targetInput.getAttribute("type") || "text"
           ).toLowerCase();
-          if (inputType === "radio" || inputType === "checkbox") {
+          if (inputType === "radio" || inputType === "checkbox")
             return targetInput;
-          }
         }
         if (targetInput) return null;
       }
@@ -2009,33 +2111,21 @@ function resolveClickTarget(rawEl) {
         const wrappedType = (
           wrappedInput.getAttribute("type") || "text"
         ).toLowerCase();
-        if (wrappedType === "radio" || wrappedType === "checkbox") {
+        if (wrappedType === "radio" || wrappedType === "checkbox")
           return wrappedInput;
-        }
+        if (isActionLikeElement(wrappedInput)) return wrappedInput;
         return null;
       }
 
       return null;
     }
 
-    if (
-      role === "button" ||
-      role === "link" ||
-      role === "menuitem" ||
-      role === "tab" ||
-      role === "option" ||
-      role === "checkbox" ||
-      role === "radio"
-    ) {
-      return el;
-    }
-
+    if (hasActionLikeRole(role)) return el;
     if (tabIndex && tabIndex !== "-1") return el;
-
     if (hasTransitionHint) return el;
 
     if (
-      hasPointerCursor &&
+      pointer &&
       (looksLikePagination ||
         looksLikeInteractiveContainer ||
         hasVisualClickSignal)
@@ -2053,7 +2143,8 @@ function resolveClickTarget(rawEl) {
     rawEl.tagName === "BUTTON" ||
     rawEl.tagName === "A" ||
     rawEl.getAttribute("role") === "button" ||
-    rawEl.hasAttribute("onclick")
+    rawEl.hasAttribute("onclick") ||
+    isActionLikeElement(rawEl)
   ) {
     return rawEl;
   }
@@ -2080,7 +2171,12 @@ function isDeadZoneElement(el) {
 function getFallbackTargetConfidence(el) {
   if (!(el instanceof Element)) return 0;
   if (isDeadZoneElement(el)) return 0;
-  if (isInputElement(el)) return 0;
+
+  const inputLike = isInputElement(el);
+  const actionLike = isActionLikeElement(el);
+
+  // Mitigation: ignore ordinary input-like elements
+  if (inputLike && !actionLike) return 0;
 
   const role = (el.getAttribute("role") || "").toLowerCase();
   const className =
@@ -2095,7 +2191,8 @@ function getFallbackTargetConfidence(el) {
     role === "menuitem" ||
     role === "tab" ||
     role === "option" ||
-    role === "treeitem"
+    role === "treeitem" ||
+    role === "combobox"
   ) {
     score += 3;
   }
@@ -2104,7 +2201,8 @@ function getFallbackTargetConfidence(el) {
     el.hasAttribute("aria-selected") ||
     el.hasAttribute("aria-current") ||
     el.hasAttribute("aria-controls") ||
-    el.hasAttribute("aria-expanded")
+    el.hasAttribute("aria-expanded") ||
+    el.hasAttribute("aria-haspopup")
   ) {
     score += 3;
   }
@@ -2130,17 +2228,13 @@ function getFallbackTargetConfidence(el) {
   );
   if (inInteractiveContainer) score += 1;
 
-  const hasPointerCursor = (() => {
-    try {
-      return window.getComputedStyle(el).cursor === "pointer";
-    } catch {
-      return false;
-    }
-  })();
-  if (hasPointerCursor) score += 1;
+  if (hasPointerCursor(el)) score += 1;
 
   const text = (getDirectTextContent(el) || "").trim();
   if (text && text.length <= 80) score += 1;
+
+  // Small bonus for input-like controls only when they are action-like
+  if (inputLike && actionLike) score += 2;
 
   return score;
 }
@@ -2160,6 +2254,7 @@ function resolveFallbackMeaningfulTarget(rawEl) {
       continue;
     }
 
+    // Keep existing LI special case
     if (el.tagName === "LI") {
       const inDropdown = el.closest(
         '[role="listbox"], [role="option"], select, [data-dropdown]',
@@ -2169,9 +2264,7 @@ function resolveFallbackMeaningfulTarget(rawEl) {
           const hasClickableSignal =
             window.getComputedStyle(el).cursor === "pointer" ||
             (el.textContent && el.textContent.trim().length > 0);
-          if (hasClickableSignal) {
-            return el;
-          }
+          if (hasClickableSignal) return el;
         } catch {}
       }
     }
@@ -2182,8 +2275,15 @@ function resolveFallbackMeaningfulTarget(rawEl) {
       best = el;
     }
 
-    if (bestScore >= FALLBACK_MIN_CONFIDENCE) {
-      return best;
+    // Mitigation: input-like elements need a higher threshold
+    if (best) {
+      const bestIsInputLike = isInputElement(best);
+      if (
+        (!bestIsInputLike && bestScore >= FALLBACK_MIN_CONFIDENCE) ||
+        (bestIsInputLike && bestScore >= ACTIONABLE_INPUT_MIN_FALLBACK_SCORE)
+      ) {
+        return best;
+      }
     }
 
     el = el.parentElement;
@@ -2664,6 +2764,40 @@ function createStep(type, element, value = null) {
   }
 
   return step;
+}
+
+function getStepSelectorKey(step) {
+  if (!step || typeof step !== "object") return "";
+  const sel = step.selector || {};
+  return String(sel.css || sel.relativeXPath || sel.xpath || "").trim();
+}
+
+function maybeDropPreviousClickForSameControl(nextInputStep) {
+  if (!nextInputStep || nextInputStep.type !== "input") return;
+  if (!steps.length) return;
+
+  const prev = steps[steps.length - 1];
+  if (!prev || prev.type !== "click") return;
+
+  const prevKey = getStepSelectorKey(prev);
+  const nextKey = getStepSelectorKey(nextInputStep);
+  if (!prevKey || !nextKey || prevKey !== nextKey) return;
+
+  const prevTs = Number(prev.timestamp || 0);
+  const nextTs = Number(nextInputStep.timestamp || 0);
+  if (!prevTs || !nextTs) return;
+
+  const delta = nextTs - prevTs;
+  if (delta < 0 || delta > CLICK_THEN_INPUT_SUPPRESS_MS) return;
+
+  // Keep meaningful transition clicks
+  const prevWasMeaningful =
+    prev.context &&
+    typeof prev.context === "object" &&
+    !!prev.context.transitionReason;
+  if (prevWasMeaningful) return;
+
+  steps.pop();
 }
 
 function getDirectTextContent(el) {
@@ -3604,7 +3738,10 @@ function handleInput(event) {
   if (tag === "SELECT") {
     const value = getElementValue(target);
     const step = createStep("input", target, value);
-    if (step) steps.push(step);
+    if (step) {
+      maybeDropPreviousClickForSameControl(step);
+      steps.push(step);
+    }
     pendingInputs.delete(key);
     return;
   }
@@ -3613,6 +3750,7 @@ function handleInput(event) {
     const value = getElementValue(target);
     const step = createStep("input", target, value);
     if (step) {
+      maybeDropPreviousClickForSameControl(step);
       steps.push(step);
     }
     pendingInputs.delete(key);
@@ -3640,6 +3778,7 @@ function handleBlur(event) {
     const value = getElementValue(target);
     const step = createStep("input", target, value);
     if (step) {
+      maybeDropPreviousClickForSameControl(step);
       steps.push(step);
       sendFlush(false);
     }
