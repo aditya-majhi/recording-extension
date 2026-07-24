@@ -39,6 +39,97 @@ let lastPointerDownDropdownOpen = { key: "", time: 0, consumed: false };
 const MEANINGFUL_CLICK_WINDOW_MS = 2200;
 const MEANINGFUL_CLICK_POLL_MS = 120;
 
+// Debounce for DIV clicks that are likely to be "backdrop" or "overlay" clicks, which can be noisy and not meaningful for recording.
+
+const DIV_BYPASS_DEBOUNCE_MS = 250;
+
+function isBackdropLike(el) {
+  if (!(el instanceof Element)) return false;
+  return !!el.closest(
+    ".modal-backdrop, .MuiBackdrop-root, .ant-modal-mask, .cdk-overlay-backdrop, [data-overlay], [role='presentation']",
+  );
+}
+
+function isForcedDivClickTarget(el) {
+  if (!(el instanceof Element)) return false;
+  if (el.tagName !== "DIV") return false;
+  if (isBackdropLike(el)) return false;
+  if (isFromRecorderUi(el)) return false;
+  return true;
+}
+
+function getStepSelectorKey(step) {
+  if (!step || typeof step !== "object") return "";
+  return String(
+    step.selector?.css ||
+      step.selector?.relativeXPath ||
+      step.selector?.xpath ||
+      "",
+  ).trim();
+}
+
+function isDuplicatePassiveDivClick(nextStep) {
+  if (!nextStep || nextStep.type !== "click") return false;
+  if (!steps.length) return false;
+
+  const prev = steps[steps.length - 1];
+  if (!prev || prev.type !== "click") return false;
+
+  const prevPassive = !!prev?.context?.passiveClick;
+  const nextPassive = !!nextStep?.context?.passiveClick;
+  if (!prevPassive || !nextPassive) return false;
+
+  const prevKey = getStepSelectorKey(prev);
+  const nextKey = getStepSelectorKey(nextStep);
+  if (!prevKey || !nextKey || prevKey !== nextKey) return false;
+
+  const prevTs = Number(prev.timestamp || 0);
+  const nextTs = Number(nextStep.timestamp || 0);
+  if (!prevTs || !nextTs) return false;
+
+  return nextTs - prevTs >= 0 && nextTs - prevTs <= DIV_BYPASS_DEBOUNCE_MS;
+}
+
+function isForcedPassiveInputTarget(el) {
+  if (!(el instanceof Element)) return false;
+  if (isFromRecorderUi(el)) return false;
+
+  const tag = el.tagName;
+  if (tag !== "INPUT" && tag !== "TEXTAREA") return false;
+  if (isBackdropLike(el)) return false;
+
+  const type = (el.getAttribute("type") || "text").toLowerCase();
+
+  // Exclude native actionable/input categories that are already handled
+  if (
+    type === "hidden" ||
+    type === "file" ||
+    type === "radio" ||
+    type === "checkbox" ||
+    type === "submit" ||
+    type === "button" ||
+    type === "reset"
+  ) {
+    return false;
+  }
+
+  const role = (el.getAttribute("role") || "").toLowerCase();
+  const cls =
+    typeof el.className === "string" ? el.className.toLowerCase() : "";
+  const readOnlyLike =
+    el.hasAttribute("readonly") ||
+    (typeof el.readOnly === "boolean" && el.readOnly === true);
+
+  const looksLikeActionControl =
+    role === "combobox" ||
+    el.getAttribute("aria-haspopup") === "listbox" ||
+    el.hasAttribute("aria-controls") ||
+    el.hasAttribute("aria-expanded") ||
+    /select|dropdown|picker|date|calendar|trigger|toggle|combobox/.test(cls);
+
+  return readOnlyLike || looksLikeActionControl;
+}
+
 // Mitigations
 const CLICK_THEN_INPUT_SUPPRESS_MS = 650;
 const ACTIONABLE_INPUT_MIN_FALLBACK_SCORE = 4;
@@ -1546,6 +1637,128 @@ function getRelativeXPath(element) {
   return `//${tag}`;
 }
 
+//To get additional xpaths
+function toXPathSingleLiteral(value) {
+  var raw = String(value == null ? "" : value);
+  if (!raw.includes("'")) {
+    return "'" + raw + "'";
+  }
+  return toXPathLiteral(raw);
+}
+
+function getTagOnlyRelativePath(fromEl, toEl) {
+  var path = [];
+  var cur = toEl;
+  while (cur && cur !== fromEl && cur instanceof Element) {
+    path.unshift(cur.tagName.toLowerCase());
+    cur = cur.parentElement;
+  }
+  if (!path.length) return "";
+  return path.join("/");
+}
+
+function findNearestStableIdAncestor(el) {
+  var cur = el ? el.parentElement : null;
+  while (cur && cur !== document.body) {
+    if (isStableId(cur.id)) return cur;
+    cur = cur.parentElement;
+  }
+  return null;
+}
+
+function buildSeleniumStyleXPathCandidates(element) {
+  if (!(element instanceof Element)) return [];
+
+  var out = [];
+  var tag = element.tagName.toLowerCase();
+
+  function push(kind, value, confidence) {
+    if (!value || typeof value !== "string" || !value.trim()) return;
+    out.push({ kind: kind, value: value.trim(), confidence: confidence });
+  }
+
+  // xpath:attributes style
+  var attrOrder = [
+    "id",
+    "name",
+    "type",
+    "value",
+    "title",
+    "aria-label",
+    "placeholder",
+  ];
+  for (var i = 0; i < attrOrder.length; i++) {
+    var attr = attrOrder[i];
+    var v = element.getAttribute(attr);
+    if (!v) continue;
+
+    if (attr === "id" && !isStableId(v)) continue;
+    if (attr === "name" && /\d{5,}/.test(v)) continue;
+
+    push(
+      "xpath:attributes",
+      "//" + tag + "[@" + attr + "=" + toXPathSingleLiteral(v) + "]",
+      attr === "id" ? 98 : 86,
+    );
+  }
+
+  // class attribute variant (closest to Selenium IDE class-ish finder)
+  var stableClasses =
+    element.classList && element.classList.length
+      ? Array.from(element.classList).filter(isStableClassName)
+      : [];
+
+  if (stableClasses.length) {
+    var cls = stableClasses[0];
+    push(
+      "xpath:attributes",
+      "//" +
+        tag +
+        '[contains(concat(" ", normalize-space(@class), " "), " ' +
+        cls +
+        ' ")]',
+      72,
+    );
+  }
+
+  // xpath:idRelative style
+  var idAncestor = findNearestStableIdAncestor(element);
+  if (idAncestor) {
+    var relPath = getTagOnlyRelativePath(idAncestor, element);
+    if (relPath) {
+      push(
+        "xpath:idRelative",
+        "//" +
+          idAncestor.tagName.toLowerCase() +
+          "[@id=" +
+          toXPathSingleLiteral(idAncestor.id) +
+          "]/" +
+          relPath,
+        90,
+      );
+    }
+  }
+
+  // xpath:position style (tag-only path from nearest structural ancestor)
+  var structural = element.closest(
+    "form, table, ul, ol, nav, section, article, main, dialog",
+  );
+  if (structural && structural !== element) {
+    var posRel = getTagOnlyRelativePath(structural, element);
+    if (posRel) {
+      push(
+        "xpath:position",
+        "//" + structural.tagName.toLowerCase() + "/" + posRel,
+        64,
+      );
+    }
+  } else {
+    push("xpath:position", "//" + tag, 40);
+  }
+
+  return out;
+}
+
 function buildSelectors(element) {
   const css = getCssSelector(element);
   const xpath = getXPath(element);
@@ -1675,6 +1888,12 @@ function buildSelectorCandidates(element) {
 
   const xpath = getXPath(element);
   if (xpath) add("xpath", xpath, 60);
+
+  // --- Selenium IDE style XPath candidates ---
+  const seleniumStyle = buildSeleniumStyleXPathCandidates(element);
+  for (const c of seleniumStyle) {
+    add(c.kind, c.value, c.confidence);
+  }
 
   // Deduplicate by kind+value (not only value) so multiple kinds are preserved
   const dedup = new Map();
@@ -2766,12 +2985,6 @@ function createStep(type, element, value = null) {
   return step;
 }
 
-function getStepSelectorKey(step) {
-  if (!step || typeof step !== "object") return "";
-  const sel = step.selector || {};
-  return String(sel.css || sel.relativeXPath || sel.xpath || "").trim();
-}
-
 function maybeDropPreviousClickForSameControl(nextInputStep) {
   if (!nextInputStep || nextInputStep.type !== "input") return;
   if (!steps.length) return;
@@ -3473,6 +3686,23 @@ function handleClick(event) {
     }
   }
 
+  if (!target) {
+    const rawIsPassiveInput = isForcedPassiveInputTarget(rawEl);
+    const rawIsForcedDiv = isForcedDivClickTarget(rawEl);
+
+    const rawInsideMenu = !!rawEl.closest(
+      '[role="listbox"], [role="menu"], .react-select__menu, .ant-select-dropdown, .ant-dropdown-menu',
+    );
+
+    const rawLooksDropdownControl = isDropdownControlElement(rawEl);
+
+    if (rawIsPassiveInput && !rawInsideMenu && !rawLooksDropdownControl) {
+      target = rawEl;
+    } else if (rawIsForcedDiv && !rawInsideMenu && !rawLooksDropdownControl) {
+      target = rawEl;
+    }
+  }
+
   dbg("handleClick:resolvedTarget", {
     targetTag: target?.tagName || null,
     targetRole: target?.getAttribute?.("role") || null,
@@ -3694,6 +3924,58 @@ function handleClick(event) {
     lastClick = { selector: css, time: now };
     drainPendingInputs();
     sendFlush(false);
+    return;
+  }
+
+  const isForcedPassiveInputClick =
+    stepType === "click" &&
+    isForcedPassiveInputTarget(target) &&
+    !isButtonLike &&
+    !isSubmitLike &&
+    !isOptionLike(target) &&
+    !isDropdownOpenClick &&
+    !clickedInsideMenu;
+
+  if (isForcedPassiveInputClick) {
+    step.context = {
+      ...(step.context && typeof step.context === "object" ? step.context : {}),
+      passiveClick: true,
+      clickConfidence: "low",
+      forcedBypass: "input",
+    };
+
+    if (!isDuplicatePassiveDivClick(step)) {
+      steps.push(step);
+      lastClick = { selector: css, time: now };
+      drainPendingInputs();
+      sendFlush(false);
+    }
+    return;
+  }
+
+  const isForcedDivClick =
+    stepType === "click" &&
+    isForcedDivClickTarget(target) &&
+    !isButtonLike &&
+    !isSubmitLike &&
+    !isOptionLike(target) &&
+    !isDropdownOpenClick &&
+    !clickedInsideMenu;
+
+  if (isForcedDivClick) {
+    step.context = {
+      ...(step.context && typeof step.context === "object" ? step.context : {}),
+      passiveClick: true,
+      clickConfidence: "low",
+      forcedBypass: "div",
+    };
+
+    if (!isDuplicatePassiveDivClick(step)) {
+      steps.push(step);
+      lastClick = { selector: css, time: now };
+      drainPendingInputs();
+      sendFlush(false);
+    }
     return;
   }
 
