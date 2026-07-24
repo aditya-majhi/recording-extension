@@ -538,6 +538,22 @@ function shortEl(el) {
 // ── Navigation flush: save steps before page unloads ──
 function handleBeforeUnload() {
   if (!isRecording) return;
+
+  if (pendingSubmitLikeClick) {
+    const { step, selectorKey } = pendingSubmitLikeClick;
+    const nextStep = {
+      ...step,
+      context:
+        step.context && typeof step.context === "object"
+          ? { ...step.context, submitReconciledAsClick: "beforeunload" }
+          : step.context,
+    };
+
+    steps.push(nextStep);
+    lastClick = { selector: selectorKey, time: nowTs() };
+    clearPendingSubmitLikeClick();
+  }
+
   console.log("[RECORDER][beforeunload] Page unloading — emergency flush");
   drainPendingInputs();
   const compressed = compressSteps([...steps]);
@@ -2297,7 +2313,17 @@ function resolveClickTarget(rawEl) {
       !!getDirectTextContent(el) || !!el.querySelector("svg, img");
 
     if (tag === "BUTTON") return el;
-    if (tag === "A" && (el.hasAttribute("href") || role)) return el;
+    if (tag === "A") {
+      const anchorClickable =
+        el.hasAttribute("href") ||
+        role === "link" ||
+        role === "button" ||
+        el.hasAttribute("onclick") ||
+        (tabIndex && tabIndex !== "-1") ||
+        (pointer && hasVisualClickSignal);
+
+      if (anchorClickable) return el;
+    }
 
     if (tag === "INPUT") {
       const type = (el.getAttribute("type") || "text").toLowerCase();
@@ -3690,6 +3716,9 @@ function handleClick(event) {
     const rawIsPassiveInput = isForcedPassiveInputTarget(rawEl);
     const rawIsForcedDiv = isForcedDivClickTarget(rawEl);
 
+    const rawAnchorEl = rawEl.tagName === "A" ? rawEl : rawEl.closest("a");
+    const rawIsAnchor = !!rawAnchorEl;
+
     const rawInsideMenu = !!rawEl.closest(
       '[role="listbox"], [role="menu"], .react-select__menu, .ant-select-dropdown, .ant-dropdown-menu',
     );
@@ -3700,6 +3729,8 @@ function handleClick(event) {
       target = rawEl;
     } else if (rawIsForcedDiv && !rawInsideMenu && !rawLooksDropdownControl) {
       target = rawEl;
+    } else if (rawIsAnchor && !rawInsideMenu) {
+      target = rawAnchorEl;
     }
   }
 
