@@ -61,9 +61,9 @@ function isForcedDivClickTarget(el) {
 function getStepSelectorKey(step) {
   if (!step || typeof step !== "object") return "";
   return String(
-    step.selector?.css ||
-      step.selector?.relativeXPath ||
+    step.selector?.relativeXPath ||
       step.selector?.xpath ||
+      step.selector?.css ||
       "",
   ).trim();
 }
@@ -338,7 +338,6 @@ function armPendingSubmitLikeClick(step, selectorKey, formEl) {
 function consumePendingSubmitLikeClickForForm(formEl) {
   if (!pendingSubmitLikeClick) return false;
   if (pendingSubmitLikeClick.formEl !== formEl) return false;
-  clearPendingSubmitLikeClick();
   return true;
 }
 
@@ -535,10 +534,8 @@ function shortEl(el) {
   };
 }
 
-// ── Navigation flush: save steps before page unloads ──
-function handleBeforeUnload() {
-  if (!isRecording) return;
-
+function forceCommitPendingClicksForUnload() {
+  // Commit submit-like click that may still be waiting for reconcile timer
   if (pendingSubmitLikeClick) {
     const { step, selectorKey } = pendingSubmitLikeClick;
     const nextStep = {
@@ -554,11 +551,52 @@ function handleBeforeUnload() {
     clearPendingSubmitLikeClick();
   }
 
+  // Commit meaningful click that may still be waiting for mutation/poll signal
+  if (pendingMeaningfulClick) {
+    const after = getUiTransitionSnapshot();
+    const step = {
+      ...pendingMeaningfulClick.step,
+      pageUrl: after.url || pendingMeaningfulClick.step.pageUrl,
+      pageTitle: after.title || pendingMeaningfulClick.step.pageTitle,
+      pageName: after.pageName || pendingMeaningfulClick.step.pageName,
+      context:
+        pendingMeaningfulClick.step.context &&
+        typeof pendingMeaningfulClick.step.context === "object"
+          ? {
+              ...pendingMeaningfulClick.step.context,
+              transitionReason: "beforeunload",
+            }
+          : pendingMeaningfulClick.step.context,
+    };
+
+    const insertAt =
+      Number.isInteger(pendingMeaningfulClick.insertAt) &&
+      pendingMeaningfulClick.insertAt >= 0
+        ? Math.min(pendingMeaningfulClick.insertAt, steps.length)
+        : steps.length;
+
+    steps.splice(insertAt, 0, step);
+    lastClick = {
+      selector: pendingMeaningfulClick.selectorKey,
+      time: nowTs(),
+    };
+
+    clearPendingMeaningfulClick();
+  }
+}
+
+// ── Navigation flush: save steps before page unloads ──
+function handleBeforeUnload() {
+  if (!isRecording) return;
+
+  forceCommitPendingClicksForUnload();
+
   console.log("[RECORDER][beforeunload] Page unloading — emergency flush");
   drainPendingInputs();
   const compressed = compressSteps([...steps]);
   const vars = [...variables];
   if (!compressed.length && !vars.length) return;
+
   try {
     chrome.runtime.sendMessage({
       type: "RECORDER_FLUSH",
@@ -584,6 +622,13 @@ export function getLastRightClickedElement() {
 
 function nowTs() {
   return Date.now();
+}
+
+function getStableSelectorKeyFromElement(el) {
+  if (!(el instanceof Element)) return "";
+  const s = buildSelectors(el);
+  // Prefer path-based keys over css to avoid class-collision issues.
+  return String(s.relativeXPath || s.xpath || s.css || "").trim();
 }
 
 function getCssSelector(element) {
@@ -2026,7 +2071,7 @@ function getElementValues(el) {
 function getSelectorKeyFromElement(el) {
   if (!(el instanceof Element)) return "";
   const s = buildSelectors(el);
-  return s.css || s.relativeXPath || s.xpath || "";
+  return s.relativeXPath || s.xpath || s.css || "";
 }
 
 function getOptionText(el) {
@@ -3500,17 +3545,17 @@ function compressSteps(allSteps) {
   allSteps.forEach((step, index) => {
     if (step.type !== "input") return;
     const key =
-      step.selector?.css ||
+      step.selector?.relativeXPath ||
       step.selector?.xpath ||
-      step.selector?.relativeXPath;
+      step.selector?.css;
     if (key) lastInputIdx.set(key, index);
   });
   const result = allSteps.filter((step, index) => {
     if (step.type !== "input") return true;
     const key =
-      step.selector?.css ||
+      step.selector?.relativeXPath ||
       step.selector?.xpath ||
-      step.selector?.relativeXPath;
+      step.selector?.css;
     if (!key) return true;
     return lastInputIdx.get(key) === index;
   });
@@ -3751,9 +3796,15 @@ function handleClick(event) {
 
   currentPageName = detectBestPageName();
 
-  const { css } = buildSelectors(target);
+  const { css, xpath, relativeXPath } = buildSelectors(target);
   const now = nowTs();
-  if (lastClick.selector === css && now - lastClick.time < CLICK_DEBOUNCE_MS) {
+  const clickKey = relativeXPath || xpath || css || "";
+
+  if (
+    clickKey &&
+    lastClick.selector === clickKey &&
+    now - lastClick.time < CLICK_DEBOUNCE_MS
+  ) {
     return;
   }
 
@@ -3838,13 +3889,22 @@ function handleClick(event) {
   const step = createStep(stepType, target, value);
   if (!step) return;
 
+  const isAnchorLike = target.tagName === "A";
+  if (isAnchorLike) {
+    steps.push(step);
+    lastClick = { selector: clickKey, time: now };
+    drainPendingInputs();
+    sendFlush(false);
+    return;
+  }
+
   if (isRadio || isCheckbox) {
     step.inputType = (target.getAttribute("type") || "").toLowerCase();
     step.checked = target.checked;
     step.fieldName = target.getAttribute("name") || null;
 
     steps.push(step);
-    lastClick = { selector: css, time: now };
+    lastClick = { selector: clickKey, time: now };
     drainPendingInputs();
     sendFlush(false);
     return;
@@ -3868,7 +3928,7 @@ function handleClick(event) {
   // If it is a real submit-like button in a form, wait briefly and reconcile with submit.
   if (isButtonLike && !isDisabledButton) {
     const selectorKey =
-      css || step.selector?.relativeXPath || step.selector?.xpath || "";
+      clickKey || step.selector?.relativeXPath || step.selector?.xpath || "";
 
     if (isSubmitLike && parentForm) {
       armPendingSubmitLikeClick(step, selectorKey, parentForm);
@@ -3876,7 +3936,7 @@ function handleClick(event) {
     }
 
     steps.push(step);
-    lastClick = { selector: css, time: now };
+    lastClick = { selector: clickKey, time: now };
     drainPendingInputs();
     sendFlush(false);
     return;
@@ -3918,7 +3978,7 @@ function handleClick(event) {
 
     // Record the selected option click
     steps.push(step);
-    lastClick = { selector: css, time: now };
+    lastClick = { selector: clickKey, time: now };
     lastOpenedDropdownKey = "";
     drainPendingInputs();
     sendFlush(false);
@@ -3944,7 +4004,7 @@ function handleClick(event) {
 
   if (isDropdownOpenClick) {
     steps.push(step);
-    lastClick = { selector: css, time: now };
+    lastClick = { selector: clickKey, time: now };
     drainPendingInputs();
     sendFlush(false);
     return;
@@ -3952,7 +4012,7 @@ function handleClick(event) {
 
   if (stepType === "click" && isDialogScopedActionTarget(target)) {
     steps.push(step);
-    lastClick = { selector: css, time: now };
+    lastClick = { selector: clickKey, time: now };
     drainPendingInputs();
     sendFlush(false);
     return;
@@ -3977,7 +4037,7 @@ function handleClick(event) {
 
     if (!isDuplicatePassiveDivClick(step)) {
       steps.push(step);
-      lastClick = { selector: css, time: now };
+      lastClick = { selector: clickKey, time: now };
       drainPendingInputs();
       sendFlush(false);
     }
@@ -4003,7 +4063,7 @@ function handleClick(event) {
 
     if (!isDuplicatePassiveDivClick(step)) {
       steps.push(step);
-      lastClick = { selector: css, time: now };
+      lastClick = { selector: clickKey, time: now };
       drainPendingInputs();
       sendFlush(false);
     }
@@ -4013,7 +4073,7 @@ function handleClick(event) {
   // For generic click candidates, only save when the click causes a next UI step.
   armMeaningfulClickCommit(
     step,
-    css || step.selector?.relativeXPath || step.selector?.xpath || "",
+    clickKey || step.selector?.relativeXPath || step.selector?.xpath || "",
   );
 }
 
@@ -4040,8 +4100,8 @@ function handleInput(event) {
     if (inputType === "radio") return;
   }
 
-  const { css } = buildSelectors(target);
-  const key = css || target;
+  const selectorKey = getStableSelectorKeyFromElement(target);
+  const key = selectorKey || target;
 
   const existing = pendingInputs.get(key);
   if (existing) {
@@ -4082,8 +4142,8 @@ function handleBlur(event) {
   const tag = target.tagName;
   if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") return;
 
-  const { css } = buildSelectors(target);
-  const key = css || target;
+  const selectorKey = getStableSelectorKeyFromElement(target);
+  const key = selectorKey || target;
   const existing = pendingInputs.get(key);
   if (existing) {
     clearTimeout(existing.timeoutId);
@@ -4115,8 +4175,7 @@ function handleSubmit(event) {
   if (isFromRecorderUi(form)) return;
 
   if (consumePendingSubmitLikeClickForForm(form)) {
-    drainPendingInputs();
-    sendFlush(false);
+    commitPendingSubmitLikeClick("form-submit");
     return;
   }
 
@@ -4126,10 +4185,15 @@ function handleSubmit(event) {
     form.querySelector("button:not([type])");
 
   const target = submitBtn || form;
-  const { css } = buildSelectors(target);
+  const { css, xpath, relativeXPath } = buildSelectors(target);
+  const submitKey = relativeXPath || xpath || css || "";
 
   const lastStep = steps[steps.length - 1];
-  if (lastStep && lastStep.type === "click" && lastStep.selector?.css === css) {
+  if (
+    lastStep &&
+    lastStep.type === "click" &&
+    getStepSelectorKey(lastStep) === submitKey
+  ) {
     drainPendingInputs();
     sendFlush(false);
     return;
@@ -4186,6 +4250,7 @@ export function startRecording() {
     document.addEventListener("submit", handleSubmit, true);
     document.addEventListener("contextmenu", handleContextMenu, true);
     window.addEventListener("beforeunload", handleBeforeUnload);
+    window.addEventListener("pagehide", handleBeforeUnload);
     listenersAttached = true;
   }
 
