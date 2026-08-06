@@ -16,7 +16,7 @@ let lastOpenedDropdownKey = "";
 let lastVariablePageName = null;
 
 const CLICK_DEBOUNCE_MS = 300;
-const INPUT_DEBOUNCE_MS = 800;
+const INPUT_DEBOUNCE_MS = 300;
 const FLUSH_INTERVAL_MS = 2000;
 const FALLBACK_MIN_CONFIDENCE = 3;
 const FALLBACK_MAX_ANCESTOR_WALK = 6;
@@ -46,7 +46,7 @@ const DIV_BYPASS_DEBOUNCE_MS = 250;
 function isBackdropLike(el) {
   if (!(el instanceof Element)) return false;
   return !!el.closest(
-    ".modal-backdrop, .MuiBackdrop-root, .ant-modal-mask, .cdk-overlay-backdrop, [data-overlay], [role='presentation']",
+    ".modal-backdrop, .MuiBackdrop-root, .ant-modal-mask, .cdk-overlay-backdrop, [data-overlay], [role='presentation']"
   );
 }
 
@@ -64,7 +64,7 @@ function getStepSelectorKey(step) {
     step.selector?.relativeXPath ||
       step.selector?.xpath ||
       step.selector?.css ||
-      "",
+      ""
   ).trim();
 }
 
@@ -161,7 +161,7 @@ function safeStorageGet(key, cb) {
       cb(null);
       return;
     }
-    chrome.storage.local.get([key], (res) => cb(res?.[key] || null));
+    chrome.storage.local.get([key], res => cb(res?.[key] || null));
   } catch {
     cb(null);
   }
@@ -244,7 +244,7 @@ function clearPersistedRecorderSession() {
 }
 
 function tryRestoreRecorderSession() {
-  safeStorageGet(RECORDER_STORAGE_KEY, (snap) => {
+  safeStorageGet(RECORDER_STORAGE_KEY, snap => {
     if (!snap || typeof snap !== "object") return;
 
     const isFresh =
@@ -345,7 +345,7 @@ function getActivePaginationMarker() {
   const el =
     document.querySelector(
       ".pagination .active, .page-item.active, .ant-pagination-item-active, " +
-        "[aria-current='page'], [data-active='true'], .Mui-selected",
+        "[aria-current='page'], [data-active='true'], .Mui-selected"
     ) || null;
 
   return (el?.textContent || "").trim() || "";
@@ -354,21 +354,21 @@ function getActivePaginationMarker() {
 function getUiTransitionSnapshot() {
   const activeNavEl =
     document.querySelector(
-      "[aria-current='page'], [aria-selected='true'], .active, .selected, .Mui-selected, .ant-menu-item-selected",
+      "[aria-current='page'], [aria-selected='true'], .active, .selected, .Mui-selected, .ant-menu-item-selected"
     ) || null;
 
   const mainHeadingEl = document.querySelector("main h1, h1, main h2, h2");
 
   const openDropdownEls = Array.from(
     document.querySelectorAll(
-      "[role='listbox'], [role='menu'], .react-select__menu, .ant-select-dropdown, .ant-dropdown-menu, .MuiMenu-list",
-    ),
+      "[role='listbox'], [role='menu'], .react-select__menu, .ant-select-dropdown, .ant-dropdown-menu, .MuiMenu-list"
+    )
   );
 
   const expandedComboboxEls = Array.from(
     document.querySelectorAll(
-      "[role='combobox'][aria-expanded='true'], [aria-haspopup='listbox'][aria-expanded='true'], .react-select__control--menu-is-open, .ant-select-open, .MuiSelect-select[aria-expanded='true']",
-    ),
+      "[role='combobox'][aria-expanded='true'], [aria-haspopup='listbox'][aria-expanded='true'], .react-select__control--menu-is-open, .ant-select-open, .MuiSelect-select[aria-expanded='true']"
+    )
   );
 
   return {
@@ -376,13 +376,13 @@ function getUiTransitionSnapshot() {
     title: document.title || "",
     pageName: detectBestPageName() || "",
     dialogCount: document.querySelectorAll(
-      "[role='dialog'], [aria-modal='true'], .modal, .MuiDialog-root, .ant-modal-root",
+      "[role='dialog'], [aria-modal='true'], .modal, .MuiDialog-root, .ant-modal-root"
     ).length,
     drawerCount: document.querySelectorAll(
-      "aside[open], .drawer.open, .MuiDrawer-root, .ant-drawer-open",
+      "aside[open], .drawer.open, .MuiDrawer-root, .ant-drawer-open"
     ).length,
     expandedCount: document.querySelectorAll(
-      "[aria-expanded='true'], details[open], .show, .open, .Mui-expanded, .ant-select-open, .ant-dropdown-open",
+      "[aria-expanded='true'], details[open], .show, .open, .Mui-expanded, .ant-select-open, .ant-dropdown-open"
     ).length,
     dropdownMenuCount: openDropdownEls.length,
     expandedComboboxCount: expandedComboboxEls.length,
@@ -654,7 +654,7 @@ function getCssSelector(element) {
       .filter(isStableClassName)
       .slice(0, 2);
     if (stableClasses.length) {
-      const cls = stableClasses.map((c) => `.${CSS.escape(c)}`).join("");
+      const cls = stableClasses.map(c => `.${CSS.escape(c)}`).join("");
       return `${element.tagName.toLowerCase()}${cls}`;
     }
   }
@@ -694,7 +694,7 @@ function getXPath(element) {
   for (; element && element.nodeType === 1; element = element.parentNode) {
     if (isStableId(element.getAttribute("id"))) {
       segs.unshift(
-        `//*[@id="${element.getAttribute("id").replace(/"/g, '\\"')}"]`,
+        `//*[@id="${element.getAttribute("id").replace(/"/g, '\\"')}"]`
       );
       break;
     } else {
@@ -812,7 +812,7 @@ function detectBrandNames() {
   const brandEl = document.querySelector(
     ".navbar-brand, .brand, .site-title, .app-name, .app-title, " +
       "header .logo-text, [class*='brand'], [class*='logo'] span, " +
-      "[class*='logo'] a",
+      "[class*='logo'] a"
   );
   if (brandEl) {
     const text = (brandEl.textContent || "").trim().toLowerCase();
@@ -853,11 +853,11 @@ function detectBestPageName() {
 
   // Strategy 1: Breadcrumb (highest confidence)
   const breadcrumb = document.querySelector(
-    '[aria-label="breadcrumb"], .breadcrumb, .breadcrumbs, nav.breadcrumb, ol.breadcrumb, [role="navigation"][aria-label*="breadcrumb" i]',
+    '[aria-label="breadcrumb"], .breadcrumb, .breadcrumbs, nav.breadcrumb, ol.breadcrumb, [role="navigation"][aria-label*="breadcrumb" i]'
   );
   if (breadcrumb) {
     const items = breadcrumb.querySelectorAll(
-      "li, a, span, .breadcrumb-item, [aria-current]",
+      "li, a, span, .breadcrumb-item, [aria-current]"
     );
     if (items.length) {
       for (const item of items) {
@@ -878,7 +878,7 @@ function detectBestPageName() {
       '[role="tab"][aria-selected="true"], ' +
       ".MuiTab-root.Mui-selected, .ant-menu-item-selected, " +
       ".menu-item.active, .menu-item.selected, " +
-      "a.router-link-active, a.router-link-exact-active",
+      "a.router-link-active, a.router-link-exact-active"
   );
   if (activeNavItem) {
     addCandidate(activeNavItem.textContent, 85, "activeNav");
@@ -889,7 +889,7 @@ function detectBestPageName() {
     '.sidebar .active, aside .active, [role="navigation"] .active, ' +
       '.sidebar [aria-current="page"], [role="navigation"] [aria-current="page"], ' +
       '.sidebar [data-active="true"], [role="navigation"] [data-active="true"], ' +
-      '.sidebar [aria-selected="true"], [role="navigation"] [aria-selected="true"]',
+      '.sidebar [aria-selected="true"], [role="navigation"] [aria-selected="true"]'
   );
   if (activeSidebarItem) {
     addCandidate(activeSidebarItem.textContent, 88, "activeSidebarItem");
@@ -898,13 +898,13 @@ function detectBestPageName() {
   // Strategy 3: Page-level heading under main content
   const mainContent = document.querySelector(
     "main, [role='main'], #content, #main, .main-content, .page-content, .content-area, " +
-      "#root main, #root [class*='content'], #root [class*='page'], .layout-content, .app-content",
+      "#root main, #root [class*='content'], #root [class*='page'], .layout-content, .app-content"
   );
   if (mainContent) {
     const heading = mainContent.querySelector(
       ":scope > h1, :scope > h2, :scope > header h1, :scope > header h2, " +
         ":scope > div > h1, :scope > div > h2, :scope > .page-header h1, :scope > .page-title, " +
-        ":scope > [class*='title'], :scope > [class*='heading']",
+        ":scope > [class*='title'], :scope > [class*='heading']"
     );
     if (heading) {
       addCandidate(heading.textContent, 80, "mainHeading");
@@ -916,7 +916,7 @@ function detectBestPageName() {
   const actionBtns = actionRoot.querySelectorAll(
     'button[type="submit"], .btn-primary, .primary, ' +
       ".ant-btn-primary, .MuiButton-containedPrimary, " +
-      '[class*="btn-primary"], [class*="primary-btn"]',
+      '[class*="btn-primary"], [class*="primary-btn"]'
   );
   for (const btn of actionBtns) {
     const rect = btn.getBoundingClientRect();
@@ -930,7 +930,7 @@ function detectBestPageName() {
     if (label.length >= 3 && label.length <= 40) {
       if (
         !/^(cancel|close|back|ok|yes|no|submit|save|delete|remove|confirm|reset|edit|update)$/i.test(
-          label,
+          label
         )
       ) {
         addCandidate(label, 68, "actionButtonLabel");
@@ -943,14 +943,14 @@ function detectBestPageName() {
   const sectionRoot = mainContent || document.body;
   const sections = sectionRoot.querySelectorAll(
     "section, article, [role='region'], fieldset, " +
-      ".section, .panel, .content-section",
+      ".section, .panel, .content-section"
   );
   for (const section of sections) {
     const rect = section.getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) continue;
     const heading = section.querySelector(
       "h1, h2, h3, legend, .section-title, .panel-title, " +
-        "[class*='section-title'], [class*='panel-title']",
+        "[class*='section-title'], [class*='panel-title']"
     );
     if (heading) {
       const text = (heading.textContent || "").trim();
@@ -967,7 +967,7 @@ function detectBestPageName() {
     if (
       h1.closest(
         '[role="dialog"], [aria-modal="true"], .modal, .card, .sidebar, ' +
-          '.drawer, aside, .accordion, .collapse, [role="complementary"]',
+          '.drawer, aside, .accordion, .collapse, [role="complementary"]'
       )
     ) {
       continue;
@@ -984,7 +984,7 @@ function detectBestPageName() {
     if (
       h2.closest(
         '[role="dialog"], [aria-modal="true"], .modal, .card, .sidebar, ' +
-          '.drawer, aside, .accordion, .collapse, [role="complementary"]',
+          '.drawer, aside, .accordion, .collapse, [role="complementary"]'
       )
     ) {
       continue;
@@ -1013,12 +1013,12 @@ function detectBestPageName() {
     const segments = path
       .split("/")
       .filter(Boolean)
-      .filter((s) => !/^[0-9a-f\-]{8,}$/i.test(s))
-      .filter((s) => !/^\d+$/.test(s));
+      .filter(s => !/^[0-9a-f\-]{8,}$/i.test(s))
+      .filter(s => !/^\d+$/.test(s));
     if (segments.length) {
       const urlName = segments
-        .map((s) =>
-          s.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
+        .map(s =>
+          s.replace(/[-_]/g, " ").replace(/\b\w/g, c => c.toUpperCase())
         )
         .join(" › ");
       addCandidate(urlName, 35, "urlPath");
@@ -1031,12 +1031,12 @@ function detectBestPageName() {
     const segments = hash
       .split("/")
       .filter(Boolean)
-      .filter((s) => !/^[0-9a-f\-]{8,}$/i.test(s))
-      .filter((s) => !/^\d+$/.test(s));
+      .filter(s => !/^[0-9a-f\-]{8,}$/i.test(s))
+      .filter(s => !/^\d+$/.test(s));
     if (segments.length) {
       const hashName = segments
-        .map((s) =>
-          s.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
+        .map(s =>
+          s.replace(/[-_]/g, " ").replace(/\b\w/g, c => c.toUpperCase())
         )
         .join(" › ");
       addCandidate(hashName, 30, "hashPath");
@@ -1070,7 +1070,25 @@ function attachRouteObserver() {
   const originalReplaceState = history.replaceState;
 
   const onRouteChange = () => {
-    [0, 150, 500, 1200].forEach((delay) => {
+    const hadPendingInputs = pendingInputs.size > 0;
+
+    // Flush pending typed input before route settles.
+    if (hadPendingInputs) {
+      drainPendingInputs();
+    }
+
+    // Reconcile submit-like click first, then meaningful navigation click.
+    if (pendingSubmitLikeClick) {
+      commitPendingSubmitLikeClick("route-change");
+    } else if (pendingMeaningfulClick) {
+      commitPendingMeaningfulClick("route-change");
+    } else if (hadPendingInputs) {
+      // If we only had inputs pending, ensure they are sent now.
+      sendFlush(false);
+    }
+
+    // Keep existing page-name stabilization behavior.
+    [0, 150, 500, 1200].forEach(delay => {
       setTimeout(() => {
         currentPageName = detectBestPageName();
       }, delay);
@@ -1124,7 +1142,7 @@ function getButtonData(element) {
     element.getAttribute("role") === "button" ||
     (element.tagName === "INPUT" &&
       CLICKABLE_INPUT_TYPES.has(
-        (element.getAttribute("type") || "text").toLowerCase(),
+        (element.getAttribute("type") || "text").toLowerCase()
       ));
 
   if (!isButton) return null;
@@ -1171,7 +1189,7 @@ function detectVariableContext(element) {
   const tableRow = element.closest("tr");
   const table = element.closest("table");
   const datagrid = element.closest(
-    '[role="grid"], [role="table"], [role="treegrid"]',
+    '[role="grid"], [role="table"], [role="treegrid"]'
   );
 
   if (tableCell || datagrid) {
@@ -1208,13 +1226,13 @@ function detectVariableContext(element) {
   }
 
   const modal = element.closest(
-    '[role="dialog"], [role="alertdialog"], .modal, .dialog, [aria-modal="true"], .MuiDialog-root, .ant-modal, .chakra-modal__content',
+    '[role="dialog"], [role="alertdialog"], .modal, .dialog, [aria-modal="true"], .MuiDialog-root, .ant-modal, .chakra-modal__content'
   );
   if (modal) {
     const modalTitle =
       modal
         .querySelector(
-          '[role="heading"], .modal-title, .dialog-title, h1, h2, h3',
+          '[role="heading"], .modal-title, .dialog-title, h1, h2, h3'
         )
         ?.textContent?.trim() || null;
     return {
@@ -1226,7 +1244,7 @@ function detectVariableContext(element) {
   }
 
   const sidebar = element.closest(
-    'aside, nav[role="navigation"], .sidebar, .drawer, .side-panel, [role="complementary"], .MuiDrawer-root, .ant-drawer',
+    'aside, nav[role="navigation"], .sidebar, .drawer, .side-panel, [role="complementary"], .MuiDrawer-root, .ant-drawer'
   );
   if (sidebar) {
     const sidebarTitle =
@@ -1241,7 +1259,7 @@ function detectVariableContext(element) {
   }
 
   const navbar = element.closest(
-    'header, nav, [role="banner"], [role="navigation"], .navbar, .nav-bar, .header, .top-bar, .MuiAppBar-root',
+    'header, nav, [role="banner"], [role="navigation"], .navbar, .nav-bar, .header, .top-bar, .MuiAppBar-root'
   );
   if (navbar) {
     return {
@@ -1251,13 +1269,13 @@ function detectVariableContext(element) {
   }
 
   const accordion = element.closest(
-    '.accordion, .collapse, .collapsible, [role="tabpanel"], .MuiAccordion-root, .ant-collapse-item, details',
+    '.accordion, .collapse, .collapsible, [role="tabpanel"], .MuiAccordion-root, .ant-collapse-item, details'
   );
   if (accordion) {
     const accordionTitle =
       accordion
         .querySelector(
-          '.accordion-header, .accordion-title, summary, [role="tab"], .MuiAccordionSummary-content, .ant-collapse-header',
+          '.accordion-header, .accordion-title, summary, [role="tab"], .MuiAccordionSummary-content, .ant-collapse-header'
         )
         ?.textContent?.trim() || null;
     return {
@@ -1272,13 +1290,13 @@ function detectVariableContext(element) {
   }
 
   const card = element.closest(
-    '.card, .panel, .tile, .MuiCard-root, .ant-card, [role="group"], .chakra-card',
+    '.card, .panel, .tile, .MuiCard-root, .ant-card, [role="group"], .chakra-card'
   );
   if (card) {
     const cardTitle =
       card
         .querySelector(
-          ".card-title, .card-header, .panel-heading, .panel-title, .MuiCardHeader-title, .ant-card-head-title, h1, h2, h3, h4",
+          ".card-title, .card-header, .panel-heading, .panel-title, .MuiCardHeader-title, .ant-card-head-title, h1, h2, h3, h4"
         )
         ?.textContent?.trim() || null;
     return {
@@ -1289,7 +1307,7 @@ function detectVariableContext(element) {
   }
 
   const toolbar = element.closest(
-    '[role="toolbar"], .toolbar, .MuiToolbar-root, .action-bar, .button-bar',
+    '[role="toolbar"], .toolbar, .MuiToolbar-root, .action-bar, .button-bar'
   );
   if (toolbar) {
     return {
@@ -1307,7 +1325,7 @@ function detectVariableContext(element) {
   }
 
   const tabPanel = element.closest(
-    '[role="tabpanel"], .tab-pane, .tab-content, .MuiTabPanel-root',
+    '[role="tabpanel"], .tab-pane, .tab-content, .MuiTabPanel-root'
   );
   if (tabPanel) {
     const tabLabel =
@@ -1327,7 +1345,7 @@ function detectVariableContext(element) {
   }
 
   const dropdown = element.closest(
-    '.dropdown, .dropdown-menu, .popover, [role="listbox"], [role="menu"], .MuiMenu-list, .MuiPopover-root, .ant-dropdown',
+    '.dropdown, .dropdown-menu, .popover, [role="listbox"], [role="menu"], .MuiMenu-list, .MuiPopover-root, .ant-dropdown'
   );
   if (dropdown) {
     return {
@@ -1340,7 +1358,7 @@ function detectVariableContext(element) {
     element.tagName === "BUTTON" ||
     (element.tagName === "INPUT" &&
       ["submit", "button", "reset"].includes(
-        (element.getAttribute("type") || "").toLowerCase(),
+        (element.getAttribute("type") || "").toLowerCase()
       )) ||
     element.getAttribute("role") === "button";
 
@@ -1459,12 +1477,12 @@ function getDialogScopedButtonXPath(element) {
   if (!isButtonLike) return null;
 
   const dialog = element.closest(
-    '[role="dialog"], [aria-modal="true"], .modal, .MuiDialog-root, .ant-modal',
+    '[role="dialog"], [aria-modal="true"], .modal, .MuiDialog-root, .ant-modal'
   );
   if (!dialog) return null;
 
   const text = normalizeSpaceText(
-    getDirectTextContent(element) || element.textContent || "",
+    getDirectTextContent(element) || element.textContent || ""
   );
   if (!text || text.length > 80) return null;
 
@@ -1504,7 +1522,7 @@ function buildOverlayScopedXPath(element) {
   if (!optionLike) return null;
 
   const text = normalizeSpaceText(
-    getDirectTextContent(element) || element.textContent || "",
+    getDirectTextContent(element) || element.textContent || ""
   );
   if (!text) return null;
 
@@ -1512,7 +1530,7 @@ function buildOverlayScopedXPath(element) {
   const itemExpr = `//${tag}[normalize-space(.)=${toXPathLiteral(text)}${itemRolePart}]`;
 
   const container = element.closest(
-    '[role="listbox"], [role="menu"], .dropdown-menu, .MuiMenu-list, .ant-select-dropdown, .ant-dropdown-menu, .popover',
+    '[role="listbox"], [role="menu"], .dropdown-menu, .MuiMenu-list, .ant-select-dropdown, .ant-dropdown-menu, .popover'
   );
 
   if (!container) return itemExpr;
@@ -1656,8 +1674,8 @@ function getRelativeXPath(element) {
   }
 
   if (element.classList.length) {
-    const mainClass = Array.from(element.classList).find((className) =>
-      isStableClassName(className),
+    const mainClass = Array.from(element.classList).find(className =>
+      isStableClassName(className)
     );
     if (mainClass) {
       const tag = element.tagName.toLowerCase();
@@ -1672,7 +1690,7 @@ function getRelativeXPath(element) {
     const table = td.closest("table");
     if (tr && table) {
       const rows = Array.from(
-        (table.querySelector("tbody") || table).querySelectorAll("tr"),
+        (table.querySelector("tbody") || table).querySelectorAll("tr")
       );
       const rowIdx = rows.indexOf(tr) + 1;
       const cells = Array.from(tr.children);
@@ -1759,7 +1777,7 @@ function buildSeleniumStyleXPathCandidates(element) {
     push(
       "xpath:attributes",
       "//" + tag + "[@" + attr + "=" + toXPathSingleLiteral(v) + "]",
-      attr === "id" ? 98 : 86,
+      attr === "id" ? 98 : 86
     );
   }
 
@@ -1778,7 +1796,7 @@ function buildSeleniumStyleXPathCandidates(element) {
         '[contains(concat(" ", normalize-space(@class), " "), " ' +
         cls +
         ' ")]',
-      72,
+      72
     );
   }
 
@@ -1795,14 +1813,14 @@ function buildSeleniumStyleXPathCandidates(element) {
           toXPathSingleLiteral(idAncestor.id) +
           "]/" +
           relPath,
-        90,
+        90
       );
     }
   }
 
   // xpath:position style (tag-only path from nearest structural ancestor)
   var structural = element.closest(
-    "form, table, ul, ol, nav, section, article, main, dialog",
+    "form, table, ul, ol, nav, section, article, main, dialog"
   );
   if (structural && structural !== element) {
     var posRel = getTagOnlyRelativePath(structural, element);
@@ -1810,7 +1828,7 @@ function buildSeleniumStyleXPathCandidates(element) {
       push(
         "xpath:position",
         "//" + structural.tagName.toLowerCase() + "/" + posRel,
-        64,
+        64
       );
     }
   } else {
@@ -1839,7 +1857,7 @@ function buildSelectorCandidates(element) {
 
   const tagName = element.tagName.toLowerCase();
   const text = normalizeSpaceText(
-    getDirectTextContent(element) || element.textContent || "",
+    getDirectTextContent(element) || element.textContent || ""
   );
 
   // --- Requested locator kinds ---
@@ -1882,7 +1900,7 @@ function buildSelectorCandidates(element) {
     add(
       "data-testid",
       `//*[@data-testid=${toXPathLiteral(testId)} or @data-test=${toXPathLiteral(testId)} or @data-qa=${toXPathLiteral(testId)}]`,
-      100,
+      100
     );
   }
 
@@ -1896,7 +1914,7 @@ function buildSelectorCandidates(element) {
     add(
       "role+aria",
       `//*[@role=${toXPathLiteral(role)} and @aria-label=${toXPathLiteral(aria)}]`,
-      90,
+      90
     );
   }
 
@@ -1915,28 +1933,28 @@ function buildSelectorCandidates(element) {
       add(
         "relativeXPath",
         `//button[contains(normalize-space(.), ${toXPathLiteral(text)})]`,
-        79,
+        79
       );
       add(
         "xpath",
         `//*[@role="button" and contains(normalize-space(.), ${toXPathLiteral(text)})]`,
-        75,
+        75
       );
       add(
         "relativeXPath",
         `//button[normalize-space(.)=${toXPathLiteral(text)}]`,
-        73,
+        73
       );
       add(
         "xpath",
         `//*[@role="button" and normalize-space(.)=${toXPathLiteral(text)}]`,
-        70,
+        70
       );
     } else if (element.tagName === "A") {
       add(
         "relativeXPath",
         `//a[normalize-space(.)=${toXPathLiteral(text)}]`,
-        72,
+        72
       );
     }
   }
@@ -2013,7 +2031,7 @@ function getElementValue(el) {
     if (ariaValueText) return ariaValueText;
 
     const hiddenInput = el.querySelector(
-      "input[type='hidden'], input[type='text']",
+      "input[type='hidden'], input[type='text']"
     );
     if (hiddenInput && hiddenInput.value && hiddenInput.value.trim()) {
       return hiddenInput.value.trim();
@@ -2021,7 +2039,7 @@ function getElementValue(el) {
 
     const selectedLike =
       el.querySelector(
-        "[aria-selected='true'], .ant-select-selection-item, .react-select__single-value, .ng-value-label, .MuiSelect-select",
+        "[aria-selected='true'], .ant-select-selection-item, .react-select__single-value, .ng-value-label, .MuiSelect-select"
       ) || null;
 
     const selectedText = selectedLike?.textContent?.trim();
@@ -2057,7 +2075,7 @@ function getElementValues(el) {
   // Native multi-select
   if (el.tagName === "SELECT" && el.multiple) {
     return Array.from(el.selectedOptions || [])
-      .map((opt) => (opt?.value ?? "").toString().trim())
+      .map(opt => (opt?.value ?? "").toString().trim())
       .filter(Boolean);
   }
 
@@ -2086,7 +2104,7 @@ function isOptionLike(el) {
     role === "option" ||
     role === "menuitem" ||
     el.matches(
-      "option, .ant-select-item-option, .react-select__option, .MuiMenuItem-root, .mat-option",
+      "option, .ant-select-item-option, .react-select__option, .MuiMenuItem-root, .mat-option"
     )
   );
 }
@@ -2097,13 +2115,13 @@ function findOwningDropdownControlFromOption(optionEl) {
   const listbox = optionEl.closest("[role='listbox'], [role='menu']");
   if (listbox && listbox.id) {
     const byAriaControls = document.querySelector(
-      "[role='combobox'][aria-controls='" + CSS.escape(listbox.id) + "']",
+      "[role='combobox'][aria-controls='" + CSS.escape(listbox.id) + "']"
     );
     if (byAriaControls instanceof Element) return byAriaControls;
   }
 
   const openCombobox = document.querySelector(
-    "[role='combobox'][aria-expanded='true'], .ant-select-open [role='combobox'], .react-select__control--menu-is-open, .MuiSelect-select[aria-expanded='true']",
+    "[role='combobox'][aria-expanded='true'], .ant-select-open [role='combobox'], .react-select__control--menu-is-open, .MuiSelect-select[aria-expanded='true']"
   );
   if (openCombobox instanceof Element) return openCombobox;
 
@@ -2115,7 +2133,7 @@ function isDropdownControl(el) {
   return (
     el.tagName === "SELECT" ||
     el.matches(
-      "[role='combobox'], [aria-haspopup='listbox'], .ant-select-selector, .react-select__control, .MuiSelect-select, .ng-select-container",
+      "[role='combobox'], [aria-haspopup='listbox'], .ant-select-selector, .react-select__control, .MuiSelect-select, .ng-select-container"
     )
   );
 }
@@ -2290,7 +2308,7 @@ function isActionLikeElement(el) {
 
     const looksLikePicker =
       /select|dropdown|picker|date|calendar|trigger|toggle|combobox/.test(
-        className,
+        className
       ) ||
       el.getAttribute("aria-haspopup") === "listbox" ||
       role === "combobox";
@@ -2345,12 +2363,12 @@ function resolveClickTarget(rawEl) {
 
     const looksLikePagination =
       /\bpagination\b|\bpage-item\b|\bpager\b|\bnext\b|\bprev\b|\bprevious\b/.test(
-        className,
+        className
       );
 
     const looksLikeInteractiveContainer =
       /\blist-item\b|\bmenu-item\b|\bnav-item\b|\btab\b|\bdrawer-item\b/.test(
-        className,
+        className
       );
 
     const pointer = hasPointerCursor(el);
@@ -2504,17 +2522,17 @@ function getFallbackTargetConfidence(el) {
 
   if (
     /\bnav\b|\bmenu\b|\btab\b|\blist\b|\bitem\b|\bpager\b|\bbreadcrumb\b/.test(
-      className,
+      className
     ) ||
     /\bnav\b|\bmenu\b|\btab\b|\blist\b|\bitem\b|\bpager\b|\bbreadcrumb\b/.test(
-      id,
+      id
     )
   ) {
     score += 1;
   }
 
   const inInteractiveContainer = !!el.closest(
-    "nav, [role='navigation'], [role='menu'], [role='tablist'], ul, ol, [data-testid], [data-qa]",
+    "nav, [role='navigation'], [role='menu'], [role='tablist'], ul, ol, [data-testid], [data-qa]"
   );
   if (inInteractiveContainer) score += 1;
 
@@ -2547,7 +2565,7 @@ function resolveFallbackMeaningfulTarget(rawEl) {
     // Keep existing LI special case
     if (el.tagName === "LI") {
       const inDropdown = el.closest(
-        '[role="listbox"], [role="option"], select, [data-dropdown]',
+        '[role="listbox"], [role="option"], select, [data-dropdown]'
       );
       if (!inDropdown) {
         try {
@@ -2587,7 +2605,7 @@ function resolveFallbackMeaningfulTarget(rawEl) {
 function isDialogScopedActionTarget(el) {
   if (!(el instanceof Element)) return false;
   return !!el.closest(
-    "[role='dialog'], [aria-modal='true'], .modal, .MuiDialog-root, .ant-modal, #save-approval-wrapper",
+    "[role='dialog'], [aria-modal='true'], .modal, .MuiDialog-root, .ant-modal, #save-approval-wrapper"
   );
 }
 
@@ -2636,7 +2654,7 @@ function isRiskyForSiblingFallback(element) {
       "[role='grid'], [role='row'], [role='table'], " +
       "ul, ol, li, [role='list'], [role='menu'], " +
       "nav, [role='tablist'], [role='tabpanel'], " +
-      ".card, .panel, .list-group, .menu, .navbar, .sidebar",
+      ".card, .panel, .list-group, .menu, .navbar, .sidebar"
   );
 }
 
@@ -2660,7 +2678,7 @@ function findLabelText(element) {
     const clone = wrappingLabel.cloneNode(true);
     clone
       .querySelectorAll("input, textarea, select, button")
-      .forEach((i) => i.remove());
+      .forEach(i => i.remove());
     const text = normalizeLabelText(clone.textContent);
     if (text) return text;
   }
@@ -2716,7 +2734,7 @@ function generateVariableName(element, kind) {
   const sourceEl =
     kind === "button"
       ? element.closest(
-          "button, [role='button'], input[type='button'], input[type='submit'], input[type='reset']",
+          "button, [role='button'], input[type='button'], input[type='submit'], input[type='reset']"
         ) || element
       : element;
 
@@ -2756,7 +2774,7 @@ function generateVariableName(element, kind) {
         tokens[0] +
         tokens
           .slice(1)
-          .map((t) => t.charAt(0).toUpperCase() + t.slice(1))
+          .map(t => t.charAt(0).toUpperCase() + t.slice(1))
           .join("");
       return `${prefix}_${camel}`.slice(0, 50);
     }
@@ -2773,7 +2791,7 @@ function generateVariableName(element, kind) {
         tokens[0] +
         tokens
           .slice(1)
-          .map((t) => t.charAt(0).toUpperCase() + t.slice(1))
+          .map(t => t.charAt(0).toUpperCase() + t.slice(1))
           .join("");
       return `${prefix}_${camel}`.slice(0, 50);
     }
@@ -2800,7 +2818,7 @@ function deriveControlMeta(element) {
   var tag = String(element.tagName || "").toLowerCase();
   var role = String(element.getAttribute("role") || "").toLowerCase();
   var ariaHasPopup = String(
-    element.getAttribute("aria-haspopup") || "",
+    element.getAttribute("aria-haspopup") || ""
   ).toLowerCase();
   var isContentEditable = element.getAttribute("contenteditable") === "true";
 
@@ -2962,17 +2980,17 @@ function createStep(type, element, value = null) {
     (/\/button(?:\[\d+\])?\//i.test(String(xpath || "")) ||
       /\/button(?:\[\d+\])?\//i.test(String(relativeXPath || "")) ||
       selectorCandidates.some(
-        (candidate) =>
+        candidate =>
           candidate &&
           typeof candidate.value === "string" &&
-          /\/button(?:\[\d+\])?\//i.test(candidate.value),
+          /\/button(?:\[\d+\])?\//i.test(candidate.value)
       ));
 
   if (shouldTrimButtonChildPath) {
     xpath = trimXPathAfterButton(xpath);
     relativeXPath = trimXPathAfterButton(relativeXPath);
 
-    selectorCandidates = selectorCandidates.map((candidate) => {
+    selectorCandidates = selectorCandidates.map(candidate => {
       if (
         candidate &&
         typeof candidate.value === "string" &&
@@ -3003,7 +3021,7 @@ function createStep(type, element, value = null) {
 
   const transientUi = !!element.closest(
     "[role='dialog'], [role='alertdialog'], [role='tooltip'], [role='menu'], [role='listbox'], " +
-      ".ant-popover, .ant-tooltip, .react-joyride__tooltip, .toast, .snackbar",
+      ".ant-popover, .ant-tooltip, .react-joyride__tooltip, .toast, .snackbar"
   );
 
   const dismissiveAction =
@@ -3138,7 +3156,7 @@ function normalizeVariableTarget(rawEl) {
     ".ant-select, .ant-select-selector, .react-select__control, " +
     ".MuiSelect-select, .ng-select-container";
 
-  const toDropdownRoot = (el) => {
+  const toDropdownRoot = el => {
     if (!(el instanceof Element)) return null;
 
     // If this is the inner combobox input, jump to stable wrapper first.
@@ -3147,7 +3165,7 @@ function normalizeVariableTarget(rawEl) {
       (el.getAttribute("role") || "").toLowerCase() === "combobox"
     ) {
       const wrapper = el.closest(
-        ".react-select__control, .ant-select, .ant-select-selector, .MuiSelect-select, .ng-select-container, [aria-haspopup='listbox']",
+        ".react-select__control, .ant-select, .ant-select-selector, .MuiSelect-select, .ng-select-container, [aria-haspopup='listbox']"
       );
       if (wrapper) return wrapper;
     }
@@ -3157,7 +3175,7 @@ function normalizeVariableTarget(rawEl) {
 
   // 1) Option/menu item -> owning dropdown control
   const optionLike = rawEl.closest(
-    "option, [role='option'], .ant-select-item-option, .MuiMenuItem-root, .mat-option, .react-select__option",
+    "option, [role='option'], .ant-select-item-option, .MuiMenuItem-root, .mat-option, .react-select__option"
   );
   if (optionLike) {
     const nativeSelect = optionLike.closest("select");
@@ -3167,7 +3185,7 @@ function normalizeVariableTarget(rawEl) {
       "[role='combobox'][aria-expanded='true'], " +
         ".ant-select-open [role='combobox'], " +
         ".react-select__control--menu-is-open, " +
-        ".MuiSelect-select[aria-expanded='true']",
+        ".MuiSelect-select[aria-expanded='true']"
     );
     if (ownerCombobox instanceof Element) {
       const root = toDropdownRoot(ownerCombobox);
@@ -3175,7 +3193,7 @@ function normalizeVariableTarget(rawEl) {
     }
 
     const nearbyCombobox = optionLike.closest(
-      "[role='combobox'], [aria-haspopup='listbox'], .ant-select, .react-select__control, .MuiSelect-select, .ng-select-container",
+      "[role='combobox'], [aria-haspopup='listbox'], .ant-select, .react-select__control, .MuiSelect-select, .ng-select-container"
     );
     if (nearbyCombobox) {
       const root = toDropdownRoot(nearbyCombobox);
@@ -3185,7 +3203,7 @@ function normalizeVariableTarget(rawEl) {
 
   // 2) Selected chip/value area -> dropdown root
   const selectedValueLike = rawEl.closest(
-    ".ant-select-selection-item, .react-select__single-value, .MuiSelect-select, .ng-value-label, [aria-live='polite']",
+    ".ant-select-selection-item, .react-select__single-value, .MuiSelect-select, .ng-value-label, [aria-live='polite']"
   );
   if (selectedValueLike) {
     const root = toDropdownRoot(selectedValueLike);
@@ -3214,7 +3232,7 @@ function normalizeVariableTarget(rawEl) {
 
   // 6) Embedded control fallback
   const embeddedInput = rawEl.querySelector(
-    "input, textarea, select, [contenteditable='true']",
+    "input, textarea, select, [contenteditable='true']"
   );
   if (embeddedInput instanceof Element && isInputElement(embeddedInput)) {
     const embeddedDropdownRoot = toDropdownRoot(embeddedInput);
@@ -3233,7 +3251,7 @@ function normalizeVariableTarget(rawEl) {
   const tableCell = rawEl.closest("td, th");
   if (tableCell) {
     const inputInCell = tableCell.querySelector(
-      "input, textarea, select, [contenteditable='true']",
+      "input, textarea, select, [contenteditable='true']"
     );
     if (inputInCell instanceof Element && isInputElement(inputInCell)) {
       const inCellDropdownRoot = toDropdownRoot(inputInCell);
@@ -3255,7 +3273,7 @@ function createVariable(kind) {
 
     // Prefer stable dropdown controls/wrappers over inner combobox inputs.
     document.querySelector(
-      ".react-select__control--is-focused, .react-select__control--menu-is-open",
+      ".react-select__control--is-focused, .react-select__control--menu-is-open"
     ),
     document.querySelector(".ant-select-focused .ant-select-selector"),
     document.querySelector(".ant-select-open .ant-select-selector"),
@@ -3268,7 +3286,7 @@ function createVariable(kind) {
   dbg("createVariable:candidates", {
     kind,
     candidateCount: candidateRoots.length,
-    candidates: candidateRoots.map((c) => ({
+    candidates: candidateRoots.map(c => ({
       tag: c?.tagName || null,
       role: c?.getAttribute?.("role") || null,
       className: c?.className || null,
@@ -3410,7 +3428,7 @@ function createVariable(kind) {
   let isMultiSelect = false;
 
   if (el.tagName === "SELECT") {
-    enumValues = Array.from(el.options).map((opt) => ({
+    enumValues = Array.from(el.options).map(opt => ({
       value: opt.value,
       label: (opt.textContent || opt.value || "").trim(),
     }));
@@ -3418,7 +3436,7 @@ function createVariable(kind) {
     if (el.multiple) {
       isMultiSelect = true;
       selectedValues = Array.from(el.selectedOptions || [])
-        .map((opt) => (opt?.value ?? "").toString().trim())
+        .map(opt => (opt?.value ?? "").toString().trim())
         .filter(Boolean);
       selectedValue = selectedValues[0] || null;
       finalValue = selectedValues; // keep structured selection in payload
@@ -3434,9 +3452,9 @@ function createVariable(kind) {
     const radioName = el.getAttribute("name");
     if (radioName) {
       const radios = document.querySelectorAll(
-        [`input[type="radio"][name="${CSS.escape(radioName)}"]`].join(", "),
+        [`input[type="radio"][name="${CSS.escape(radioName)}"]`].join(", ")
       );
-      enumValues = Array.from(radios).map((r) => {
+      enumValues = Array.from(radios).map(r => {
         const optLabel = getRadioSelectedLabel(r);
         return {
           value: r.getAttribute("value") || optLabel,
@@ -3492,7 +3510,7 @@ function createVariable(kind) {
   if (isButtonVariable && buttonData) {
     variable.context = mergeContextWithCaptureMeta(
       { type: "button" },
-      { ...controlMeta, captureMode: "button-text" },
+      { ...controlMeta, captureMode: "button-text" }
     );
     variable.captureMode = "button-text";
     variable.isButtonElement = true;
@@ -3587,9 +3605,9 @@ function sendFlush(isFinal) {
     isFinal,
   };
 
-  return new Promise((resolve) => {
+  return new Promise(resolve => {
     try {
-      chrome.runtime.sendMessage(payload, (res) => {
+      chrome.runtime.sendMessage(payload, res => {
         dbg("flush:ack", {
           hasRuntimeError: !!chrome.runtime.lastError,
           ack: res || null,
@@ -3598,7 +3616,7 @@ function sendFlush(isFinal) {
         if (chrome.runtime.lastError) {
           console.error(
             "[RECORDER][sendFlush] chrome.runtime.lastError:",
-            chrome.runtime.lastError.message,
+            chrome.runtime.lastError.message
           );
         }
         resolve(res);
@@ -3668,7 +3686,7 @@ function handlePointerDown(event) {
   });
 
   const insideMenu = rawEl.closest(
-    '[role="listbox"], [role="menu"], .react-select__menu, .ant-select-dropdown, .ant-dropdown-menu',
+    '[role="listbox"], [role="menu"], .react-select__menu, .ant-select-dropdown, .ant-dropdown-menu'
   );
   if (insideMenu) {
     dbg("pd:skip:insideMenu", {
@@ -3733,7 +3751,7 @@ function handleClick(event) {
 
   if (!target && openedDropdown) {
     const insideMenu = rawEl.closest(
-      '[role="listbox"], [role="menu"], .react-select__menu, .ant-select-dropdown, .ant-dropdown-menu',
+      '[role="listbox"], [role="menu"], .react-select__menu, .ant-select-dropdown, .ant-dropdown-menu'
     );
     if (!insideMenu) {
       let ctrl = openedDropdown;
@@ -3743,7 +3761,7 @@ function handleClick(event) {
       ) {
         ctrl =
           ctrl.closest(
-            ".react-select__control, .ant-select-selector, [aria-haspopup='listbox']",
+            ".react-select__control, .ant-select-selector, [aria-haspopup='listbox']"
           ) || ctrl;
       }
       const {
@@ -3765,7 +3783,7 @@ function handleClick(event) {
     const rawIsAnchor = !!rawAnchorEl;
 
     const rawInsideMenu = !!rawEl.closest(
-      '[role="listbox"], [role="menu"], .react-select__menu, .ant-select-dropdown, .ant-dropdown-menu',
+      '[role="listbox"], [role="menu"], .react-select__menu, .ant-select-dropdown, .ant-dropdown-menu'
     );
 
     const rawLooksDropdownControl = isDropdownControlElement(rawEl);
@@ -3862,7 +3880,7 @@ function handleClick(event) {
     target.tagName === "BUTTON" ||
     (target.tagName === "INPUT" &&
       CLICKABLE_INPUT_TYPES.has(
-        (target.getAttribute("type") || "").toLowerCase(),
+        (target.getAttribute("type") || "").toLowerCase()
       )) ||
     target.getAttribute("role") === "button";
 
@@ -3991,7 +4009,7 @@ function handleClick(event) {
   }
 
   const clickedInsideMenu = !!rawEl.closest(
-    '[role="listbox"], [role="menu"], .react-select__menu, .ant-select-dropdown, .ant-dropdown-menu',
+    '[role="listbox"], [role="menu"], .react-select__menu, .ant-select-dropdown, .ant-dropdown-menu'
   );
 
   const isDropdownOpenClick =
@@ -4073,7 +4091,7 @@ function handleClick(event) {
   // For generic click candidates, only save when the click causes a next UI step.
   armMeaningfulClickCommit(
     step,
-    clickKey || step.selector?.relativeXPath || step.selector?.xpath || "",
+    clickKey || step.selector?.relativeXPath || step.selector?.xpath || ""
   );
 }
 
@@ -4125,11 +4143,53 @@ function handleInput(event) {
     if (step) {
       maybeDropPreviousClickForSameControl(step);
       steps.push(step);
+      sendFlush(false);
     }
     pendingInputs.delete(key);
   }, INPUT_DEBOUNCE_MS);
 
   pendingInputs.set(key, { timeoutId, element: target });
+}
+
+function handleChange(event) {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  if (!isRecording) return;
+  if (isFromRecorderUi(target)) return;
+  if (shouldIgnoreAsInputTarget(target)) return;
+
+  const tag = target.tagName;
+  if (
+    tag !== "INPUT" &&
+    tag !== "TEXTAREA" &&
+    tag !== "SELECT" &&
+    target.getAttribute("contenteditable") !== "true"
+  ) {
+    return;
+  }
+
+  // Radio is already handled in click flow.
+  if (tag === "INPUT") {
+    const inputType = (target.getAttribute("type") || "").toLowerCase();
+    if (inputType === "radio") return;
+  }
+
+  const selectorKey = getStableSelectorKeyFromElement(target);
+  const key = selectorKey || target;
+
+  const existing = pendingInputs.get(key);
+  if (existing) {
+    clearTimeout(existing.timeoutId);
+    pendingInputs.delete(key);
+  }
+
+  const value = getElementValue(target);
+  const step = createStep("input", target, value);
+  if (step) {
+    maybeDropPreviousClickForSameControl(step);
+    steps.push(step);
+    sendFlush(false);
+  }
 }
 
 function handleBlur(event) {
@@ -4245,6 +4305,7 @@ export function startRecording() {
   if (!listenersAttached) {
     document.addEventListener("pointerdown", handlePointerDown, true);
     document.addEventListener("click", handleClick, true);
+    document.addEventListener("change", handleChange, true);
     document.addEventListener("input", handleInput, true);
     document.addEventListener("blur", handleBlur, true);
     document.addEventListener("submit", handleSubmit, true);
